@@ -283,7 +283,7 @@ def handle_pre(hook_json: dict):
     encoding, confidence = detect_encoding(path)
     norm = normalize_encoding(encoding)
 
-    if norm not in _RESTORE_SET:
+    if _strip_enc(norm) not in _RESTORE_SET:
         return
 
     if confidence < 0.5:
