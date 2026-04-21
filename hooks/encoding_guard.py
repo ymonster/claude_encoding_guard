@@ -10,6 +10,7 @@ Strategy:
     1. PreToolUse (Read):  detect encoding + line endings, convert to UTF-8 so Claude reads correctly
     2. PreToolUse (Edit):  file already UTF-8 (cache exists), skip
     3. PostToolUse (Edit): restore original encoding + line endings from session cache
+    4. Stop (restore-all): restore any remaining files that were read but never edited
 
 Cache layout:
     <tempdir>/.cc_encoding_cache/<session_id>/<sha256(normalized_path)[:16]>.json
@@ -326,9 +327,52 @@ def handle_post(hook_json: dict | None):
              f"file remains UTF-8, cache preserved for retry")
 
 
+def handle_restore_all(hook_json: dict | None):
+    """Restore every file still in the session cache (e.g. Read-only without Edit)."""
+    if not hook_json:
+        return
+    session_id = hook_json.get("session_id", "unknown")
+    sd = session_dir(session_id)
+    if not os.path.isdir(sd):
+        return
+    try:
+        entries = os.listdir(sd)
+    except OSError as e:
+        _log(f"cannot list session dir {sd}: {e}")
+        return
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        cp = os.path.join(sd, name)
+        try:
+            with open(cp, "r") as f:
+                cached = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            _log(f"failed to read {cp}: {e}")
+            with contextlib.suppress(OSError):
+                os.unlink(cp)
+            continue
+        path = cached.get("path")
+        orig_enc = cached.get("encoding")
+        orig_eol = cached.get("line_ending", "lf")
+        if not path or not orig_enc:
+            with contextlib.suppress(OSError):
+                os.unlink(cp)
+            continue
+        if not os.path.isfile(path):
+            with contextlib.suppress(OSError):
+                os.unlink(cp)
+            continue
+        if convert_file(path, "utf-8", orig_enc, target_eol=orig_eol):
+            delete_cache(session_id, path)
+            _log(f"[{session_id[:8]}] stop-restored {path} utf-8→{orig_enc} eol={orig_eol}")
+        else:
+            _log(f"[{session_id[:8]}] stop-restore FAILED for {path}, cache preserved")
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("pre", "post"):
-        _log("Usage: encoding_guard.py <pre|post>")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("pre", "post", "restore-all"):
+        _log("Usage: encoding_guard.py <pre|post|restore-all>")
         sys.exit(0)  # never block Claude Code
 
     mode = sys.argv[1]
@@ -351,8 +395,10 @@ def main():
             if hook_json is None:
                 sys.exit(0)
             handle_pre(hook_json)
-        else:
+        elif mode == "post":
             handle_post(hook_json)
+        else:
+            handle_restore_all(hook_json)
     except Exception as e:
         _log(f"unhandled error ({mode}): {e}")
         # Never block Claude Code
