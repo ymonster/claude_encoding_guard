@@ -48,6 +48,17 @@ ENCODING_ALIASES = {
     "iso-8859-1": "windows-1252",
 }
 
+# CJK encodings whose chardet detection (>=0.9 confidence) is reliable enough
+# to skip the binaryornot pre-check. binaryornot's decision tree false-positives
+# short Shift_JIS / EUC-JP / EUC-KR / Big5 / GB18030 files (<~500B) as binary;
+# chardet's structural validators for these encodings have strict byte-range
+# rules that real binaries cannot satisfy at high confidence.
+CJK_TRUSTED = {
+    "gbk", "gb18030",
+    "big5", "big5hkscs",
+    "shiftjis", "eucjp", "euckr", "iso2022jp",
+}
+
 
 def _strip_enc(name: str) -> str:
     return name.lower().replace("-", "").replace("_", "")
@@ -273,14 +284,6 @@ def handle_pre(hook_json: dict):
         delete_cache(session_id, path)
         # Fall through to re-convert
 
-    try:
-        from binaryornot.check import is_binary
-        if is_binary(path):
-            return
-    except Exception as e:
-        _log(f"binary check failed for {path}: {e}")
-        return
-
     encoding, confidence = detect_encoding(path)
     norm = normalize_encoding(encoding)
 
@@ -290,6 +293,20 @@ def handle_pre(hook_json: dict):
     if confidence < 0.5:
         _log(f"skipping {path} — confidence too low ({confidence:.2f}) for {norm}")
         return
+
+    # Trust chardet for CJK (encoding name + the >= 0.5 confidence gate above
+    # is already enforced). binaryornot false-positives short J/K files; for
+    # CJK encodings chardet's structural validators are strict enough on their
+    # own. Non-CJK encodings (Windows-1252, ISO-8859-1) still go through
+    # binaryornot since those single-byte encodings cannot rule out binary.
+    if _strip_enc(norm) not in CJK_TRUSTED:
+        try:
+            from binaryornot.check import is_binary
+            if is_binary(path):
+                return
+        except Exception as e:
+            _log(f"binary check failed for {path}: {e}")
+            return
 
     with open(path, "rb") as f:
         raw = f.read()

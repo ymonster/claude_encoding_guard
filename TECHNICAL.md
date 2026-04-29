@@ -32,12 +32,23 @@ Windows antivirus or indexing services may temporarily lock files. The hook hand
 
 ### chardet Version Sensitivity
 
-| Version | Same 50KB GBK file | Result |
-|---------|-------------------|--------|
-| chardet 5.2.0 | GB2312, confidence 0.99 | Hook converts ✓ |
-| chardet 7.4.1 | GB18030, confidence 0.40 | Below 0.5 threshold, hook skips ✗ |
+chardet 7.x is a complete rewrite (Mar 2026) with a cosine-similarity bigram-model scoring system. Its confidence values are **not directly comparable** to chardet 5.x: same content gives very different numbers, and the calibration varies by encoding (driven by bigram inventory size in each model).
 
-chardet 7.x restructured its detection models, significantly reducing confidence for CJK encodings. Pinned to `>=5,<6` via PEP 723 inline metadata. The `uv run --script` creates an isolated environment — the pinned version does not affect the user's project dependencies.
+| Encoding | chardet 5.2.0 confidence | chardet 7.4.3 confidence (typical, 5KB sample) |
+|---|---|---|
+| GBK / GB2312 | 0.99 | 0.59–0.67 |
+| Big5 | 0.99 | **0.37–0.40** (large bigram inventory geometry, see chardet design doc) |
+| GB18030 | 0.99 | 0.14–0.25 |
+| EUC-JP | 0.99 | 0.83–0.91 |
+| Shift_JIS | 0.99 | 0.83 (returned as `cp932`, not `SHIFT_JIS`) |
+| EUC-KR | 0.99 | 0.85 (returned as `CP949`, not `EUC-KR`) |
+
+Other behavioral changes in 7.x that block a drop-in upgrade:
+- **Built-in binary detection** at pipeline stage 5 returns `encoding=None` for binaries (could replace binaryornot)
+- **Default encoding names changed** for some codecs — `shift_jis` → `cp932`, `euc-kr` → `CP949` (deliberate for the latter; arguably a missing `_COMPAT_NAMES` mapping for the former)
+- **`max_bytes`, `encoding_era`, `include_encodings`, `prefer_superset`, `compat_names`** — new tuning parameters
+
+Pinned to `>=5,<6` via PEP 723 inline metadata until a deliberate 7.x migration redesigns the encoding-set, threshold, and binary-check layers together. The `uv run --script` creates an isolated environment — the pinned version does not affect the user's project dependencies.
 
 ### Binary File Misidentification
 
@@ -52,7 +63,24 @@ Tested with real `.lib` and `.dll` files:
 
 Windows-1252 is a single-byte encoding that can decode almost any byte sequence without error. Without binary detection, the hook would "successfully" convert binary files, and Claude's subsequent edit would corrupt them irreversibly.
 
-[binaryornot](https://github.com/binaryornot/binaryornot) uses a trained decision tree with 24 features including CJK encoding validity checks, Shannon entropy, magic signatures, and null byte ratios. It correctly identifies all tested binary files while allowing GBK/Big5 text files through.
+[binaryornot](https://github.com/binaryornot/binaryornot) uses a trained decision tree with 24 features including CJK encoding validity checks, Shannon entropy, magic signatures, and null byte ratios. It correctly identifies all tested binary files but **false-positives short Shift_JIS / EUC-JP / EUC-KR / Big5 / GB18030 files** (typically <500 bytes — observed at 50–240 bytes in PoC). The decision tree is trained on byte distributions that overlap with short J/K text patterns.
+
+To resolve this without losing binaryornot's protection on Windows-1252 binaries, the Pre hook uses a CJK-trusted short-circuit:
+
+```python
+encoding, confidence = chardet.detect(...)
+if _strip_enc(norm) not in _RESTORE_SET:    # outside our supported set: skip
+    return
+if confidence < 0.5:                         # confidence floor: skip
+    return
+if _strip_enc(norm) not in CJK_TRUSTED:      # only run binaryornot for non-CJK
+    if is_binary(path):
+        return
+```
+
+`CJK_TRUSTED = {gbk, gb18030, big5, big5hkscs, shiftjis, eucjp, euckr, iso2022jp}`. CJK encodings have strict multi-byte structural rules that chardet's CJK probers verify directly — a real binary cannot satisfy lead-byte / trail-byte ranges across hundreds of bytes at confidence ≥ 0.5. binaryornot remains the binary check for Windows-1252 / ISO-8859-1, where chardet alone cannot rule out binary (single-byte encodings can decode any bytes).
+
+Validated on 100+ fixtures (our PoC + binaryornot's own test set): 49/49 supported text files correctly converted (including 35-byte Big5 / GBK / EUC-JP / EUC-KR), 33/33 binaries correctly rejected, zero corruption.
 
 ### Encoding Aliases
 
