@@ -63,30 +63,50 @@ Tested with real `.lib` and `.dll` files:
 
 Windows-1252 is a single-byte encoding that can decode almost any byte sequence without error. Without binary detection, the hook would "successfully" convert binary files, and Claude's subsequent edit would corrupt them irreversibly.
 
-[binaryornot](https://github.com/binaryornot/binaryornot) uses a trained decision tree with 24 features including CJK encoding validity checks, Shannon entropy, magic signatures, and null byte ratios. It correctly identifies all tested binary files but **false-positives short Shift_JIS / EUC-JP / EUC-KR / Big5 / GB18030 files** (typically <500 bytes — observed at 50–240 bytes in PoC). The decision tree is trained on byte distributions that overlap with short J/K text patterns.
+[binaryornot](https://github.com/binaryornot/binaryornot) uses a trained decision tree with 24 features including CJK encoding validity checks, Shannon entropy, magic signatures, and null byte ratios. It correctly identifies all tested binary files but false-positives in two patterns:
 
-To resolve this without losing binaryornot's protection on Windows-1252 binaries, the Pre hook uses a CJK-trusted short-circuit:
+- **Short CJK files** (<500 bytes Shift_JIS / EUC-JP / EUC-KR / Big5 / GB18030, observed at 50–240 bytes in PoC).
+- **Mixed Cyrillic + ASCII files** — e.g., source code with CP1251 comments. Empirically a 115-byte C source with a single CP1251 comment line is flagged binary even though `chardet` returns `windows-1251` at 0.99 confidence.
+
+To resolve this without losing binaryornot's protection on Windows-1252 binaries, the Pre hook uses a structural-trust short-circuit:
 
 ```python
 encoding, confidence = chardet.detect(...)
-if _strip_enc(norm) not in _RESTORE_SET:    # outside our supported set: skip
+if _strip_enc(norm) not in _RESTORE_SET:        # outside our supported set: skip
     return
-if confidence < 0.5:                         # confidence floor: skip
+if confidence < 0.5:                             # confidence floor: skip
     return
-if _strip_enc(norm) not in CJK_TRUSTED:      # only run binaryornot for non-CJK
+if _strip_enc(norm) not in STRUCTURAL_TRUSTED:   # only run binaryornot if not trusted
     if is_binary(path):
         return
 ```
 
-`CJK_TRUSTED = {gbk, gb18030, big5, big5hkscs, shiftjis, eucjp, euckr, iso2022jp}`. CJK encodings have strict multi-byte structural rules that chardet's CJK probers verify directly — a real binary cannot satisfy lead-byte / trail-byte ranges across hundreds of bytes at confidence ≥ 0.5. binaryornot remains the binary check for Windows-1252 / ISO-8859-1, where chardet alone cannot rule out binary (single-byte encodings can decode any bytes).
+`STRUCTURAL_TRUSTED = {gbk, gb18030, big5, big5hkscs, shiftjis, eucjp, euckr, iso2022jp, windows1251}`. These encodings have strict structural rules (multi-byte lead/trail ranges for CJK; characteristic Cyrillic byte distribution for cp1251) that chardet's probers verify directly — a real binary cannot satisfy them across hundreds of bytes at confidence ≥ 0.5. binaryornot remains the binary check for Windows-1252 / ISO-8859-1, where chardet alone cannot rule out binary (single-byte Latin encodings can decode any bytes).
 
-Validated on 100+ fixtures (our PoC + binaryornot's own test set): 49/49 supported text files correctly converted (including 35-byte Big5 / GBK / EUC-JP / EUC-KR), 33/33 binaries correctly rejected, zero corruption.
+Validated on 100+ fixtures (our PoC + binaryornot's own test set + Cyrillic 8-size matrix in `_backup/fixtures/cyrillic_sizes/`): all supported text files correctly converted with byte-identical round-trip, all binaries correctly rejected, zero corruption.
 
 ### Encoding Aliases
 
 chardet reports `GB2312` but Python's `gb2312` codec is stricter than `gbk`. Real-world files labeled GB2312 often contain GBK-range characters. Mapping to the superset (`gbk`) avoids `UnicodeEncodeError` during restore.
 
 Similarly, `ISO-8859-1` → `Windows-1252` follows the HTML specification's behavior. The 0x80-0x9F range in real files almost always contains CP1252 characters (€, curly quotes, em dash), not C1 control characters.
+
+### Codec Name Preservation
+
+`normalize_encoding` returns chardet's name verbatim for the non-aliased path:
+
+```python
+def normalize_encoding(enc: str) -> str:
+    stripped = _strip_enc(enc)
+    for orig, alias in ENCODING_ALIASES.items():
+        if stripped == _strip_enc(orig):
+            return alias
+    return enc                  # NOT _strip_enc(enc)
+```
+
+Returning the dash-stripped form (`"windows1251"`, `"windows1252"`, `"iso88591"`) breaks codec lookup. Python's codec normalizer replaces `-` with `_` but cannot recover a missing separator: `windows-1251` / `windows_1251` / `cp1251` all resolve to the cp1251 codec, but `windows1251` raises `LookupError`.
+
+The aliased path (gb2312 → gbk, iso-8859-1 → windows-1252) was unaffected because the alias value is returned verbatim with its dashes intact. Direct chardet hits on `windows-1252` silently failed in `convert_file` until [#3](https://github.com/ymonster/claude_encoding_guard/pull/3) added windows-1251 to RESTORE_ENCODINGS and exposed the same pattern across every Cyrillic test size — surfacing the latent bug for both encodings simultaneously.
 
 ## Cache Design
 
