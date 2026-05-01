@@ -91,6 +91,8 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 
 感谢 [@lbresler](https://github.com/lbresler) 贡献的 [#1](https://github.com/ymonster/claude_encoding_guard/pull/1)（修复 ISO-8859-1 / GB2312 的 alias-dash 不匹配问题）和 [#2](https://github.com/ymonster/claude_encoding_guard/pull/2)（`handle_restore_all` + Stop hook 恢复 Read-without-Edit 场景）。
 
+感谢 [@Pacman766](https://github.com/Pacman766) 贡献的 [#3](https://github.com/ymonster/claude_encoding_guard/pull/3)（Windows-1251 / CP1251 西里尔文编码支持）。
+
 ## License
 
 MIT
