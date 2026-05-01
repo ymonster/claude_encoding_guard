@@ -41,6 +41,7 @@ RESTORE_ENCODINGS = {
     "shift_jis", "euc-jp", "iso-2022-jp",
     "euc-kr",
     "windows-1252", "iso-8859-1",
+    "windows-1251",
 }
 
 ENCODING_ALIASES = {

@@ -27,7 +27,7 @@ Conversion happens at **Read time**, before Claude Code loads the file into memo
 
 ## Features
 
-- **Encoding preservation**: GBK, GB2312, GB18030, Big5, Big5-HKSCS, EUC-TW, Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, Windows-1252, ISO-8859-1
+- **Encoding preservation**: GBK, GB2312, GB18030, Big5, Big5-HKSCS, EUC-TW, Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, Windows-1252, Windows-1251 (Cyrillic), ISO-8859-1
 - **Line ending preservation**: CRLF restored after Claude Code converts to LF
 - **Binary file protection**: Prevents chardet from misidentifying binary files (always on, not configurable)
 - **Session isolation**: Multiple Claude Code sessions won't interfere with each other
