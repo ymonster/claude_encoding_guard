@@ -48,15 +48,18 @@ ENCODING_ALIASES = {
     "iso-8859-1": "windows-1252",
 }
 
-# CJK encodings whose chardet detection (>=0.9 confidence) is reliable enough
-# to skip the binaryornot pre-check. binaryornot's decision tree false-positives
-# short Shift_JIS / EUC-JP / EUC-KR / Big5 / GB18030 files (<~500B) as binary;
-# chardet's structural validators for these encodings have strict byte-range
-# rules that real binaries cannot satisfy at high confidence.
-CJK_TRUSTED = {
+# Encodings whose chardet detection (>=0.5 confidence + name-in-RESTORE) is
+# reliable enough to skip the binaryornot pre-check. binaryornot's decision
+# tree false-positives mixed-content files in two patterns:
+#   - short CJK files (<~500B Shift_JIS/EUC-JP/EUC-KR/Big5/GB18030)
+#   - mixed Cyrillic + ASCII files (e.g., source code with CP1251 comments)
+# For these encodings chardet's structural validators are strict enough on
+# their own; real binaries cannot reach the confidence threshold.
+STRUCTURAL_TRUSTED = {
     "gbk", "gb18030",
     "big5", "big5hkscs",
     "shiftjis", "eucjp", "euckr", "iso2022jp",
+    "windows1251",
 }
 
 
@@ -69,11 +72,19 @@ def _log(msg: str):
 
 
 def normalize_encoding(enc: str) -> str:
+    """Map chardet output to a Python codec name.
+
+    Apply ENCODING_ALIASES safety mappings (gb2312 -> gbk, iso-8859-1 ->
+    windows-1252) when applicable; otherwise preserve chardet's original
+    name verbatim. Returning the stripped form (e.g. "windows1251" without
+    its dash) breaks codec lookup since Python's codec registry recognizes
+    "windows-1251" / "cp1251" but NOT "windows1251".
+    """
     stripped = _strip_enc(enc)
     for orig, alias in ENCODING_ALIASES.items():
         if stripped == _strip_enc(orig):
             return alias
-    return stripped
+    return enc
 
 
 def normalize_path(path: str) -> str:
@@ -294,12 +305,13 @@ def handle_pre(hook_json: dict):
         _log(f"skipping {path} — confidence too low ({confidence:.2f}) for {norm}")
         return
 
-    # Trust chardet for CJK (encoding name + the >= 0.5 confidence gate above
-    # is already enforced). binaryornot false-positives short J/K files; for
-    # CJK encodings chardet's structural validators are strict enough on their
-    # own. Non-CJK encodings (Windows-1252, ISO-8859-1) still go through
-    # binaryornot since those single-byte encodings cannot rule out binary.
-    if _strip_enc(norm) not in CJK_TRUSTED:
+    # Trust chardet for STRUCTURAL_TRUSTED encodings (CJK + Cyrillic) where
+    # the confidence + name gate above is already enforced. binaryornot
+    # false-positives short J/K files and mixed Cyrillic+ASCII files; for
+    # these encodings chardet's structural validators are strict enough on
+    # their own. Other single-byte encodings (Windows-1252, ISO-8859-1) still
+    # go through binaryornot since they cannot structurally rule out binary.
+    if _strip_enc(norm) not in STRUCTURAL_TRUSTED:
         try:
             from binaryornot.check import is_binary
             if is_binary(path):
