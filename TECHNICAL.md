@@ -48,13 +48,15 @@ Other behavioral changes in 7.x that block a drop-in upgrade:
 - **Default encoding names changed** for some codecs — `shift_jis` → `cp932`, `euc-kr` → `CP949` (deliberate for the latter; arguably a missing `_COMPAT_NAMES` mapping for the former)
 - **`max_bytes`, `encoding_era`, `include_encodings`, `prefer_superset`, `compat_names`** — new tuning parameters
 
-Pinned to `>=5,<6` via PEP 723 inline metadata until a deliberate 7.x migration redesigns the encoding-set, threshold, and binary-check layers together. The `uv run --script` creates an isolated environment — the pinned version does not affect the user's project dependencies.
+**On this branch (`chardet7-preview`)**, chardet is pinned to `>=7,<8`. The migration was driven by an empirically validated detect-and-trust strategy — see "chardet 7.x Migration Findings" below. The `uv run --script` creates an isolated environment — the pinned version does not affect the user's project dependencies.
 
-### Binary File Misidentification
+### Binary File Misidentification (historical, applies to `main`)
 
-Tested with real `.lib` and `.dll` files:
+This section describes the binary-detection design on the `main` branch (chardet 5.x + binaryornot). On `chardet7-preview` it has been replaced by chardet 7.x's pipeline stage 5 — see "chardet 7.x Migration Findings → Why no manual binary check" below.
 
-| File | chardet result | Would trigger hook? |
+Tested with real `.lib` and `.dll` files on chardet 5.x:
+
+| File | chardet 5.x result | Would trigger hook? |
 |------|---------------|-------------------|
 | `iconv.lib` (3KB) | Windows-1252, 0.73 | Yes — **dangerous** |
 | `pthreadVC2.dll` (55KB) | KOI8-R, 0.61 | Yes — **dangerous** |
@@ -63,27 +65,7 @@ Tested with real `.lib` and `.dll` files:
 
 Windows-1252 is a single-byte encoding that can decode almost any byte sequence without error. Without binary detection, the hook would "successfully" convert binary files, and Claude's subsequent edit would corrupt them irreversibly.
 
-[binaryornot](https://github.com/binaryornot/binaryornot) uses a trained decision tree with 24 features including CJK encoding validity checks, Shannon entropy, magic signatures, and null byte ratios. It correctly identifies all tested binary files but false-positives in two patterns:
-
-- **Short CJK files** (<500 bytes Shift_JIS / EUC-JP / EUC-KR / Big5 / GB18030, observed at 50–240 bytes in PoC).
-- **Mixed Cyrillic + ASCII files** — e.g., source code with CP1251 comments. Empirically a 115-byte C source with a single CP1251 comment line is flagged binary even though `chardet` returns `windows-1251` at 0.99 confidence.
-
-To resolve this without losing binaryornot's protection on Windows-1252 binaries, the Pre hook uses a structural-trust short-circuit:
-
-```python
-encoding, confidence = chardet.detect(...)
-if _strip_enc(norm) not in _RESTORE_SET:        # outside our supported set: skip
-    return
-if confidence < 0.5:                             # confidence floor: skip
-    return
-if _strip_enc(norm) not in STRUCTURAL_TRUSTED:   # only run binaryornot if not trusted
-    if is_binary(path):
-        return
-```
-
-`STRUCTURAL_TRUSTED = {gbk, gb18030, big5, big5hkscs, shiftjis, eucjp, euckr, iso2022jp, windows1251}`. These encodings have strict structural rules (multi-byte lead/trail ranges for CJK; characteristic Cyrillic byte distribution for cp1251) that chardet's probers verify directly — a real binary cannot satisfy them across hundreds of bytes at confidence ≥ 0.5. binaryornot remains the binary check for Windows-1252 / ISO-8859-1, where chardet alone cannot rule out binary (single-byte Latin encodings can decode any bytes).
-
-Validated on 100+ fixtures (our PoC + binaryornot's own test set + Cyrillic 8-size matrix in `_backup/fixtures/cyrillic_sizes/`): all supported text files correctly converted with byte-identical round-trip, all binaries correctly rejected, zero corruption.
+On `main`, [binaryornot](https://github.com/binaryornot/binaryornot) handles this with a 24-feature decision tree, plus a `STRUCTURAL_TRUSTED` short-circuit to bypass binaryornot's known false positives on short CJK files and mixed Cyrillic+ASCII content. Both layers are removed on this branch because chardet 7.x's stage 5 returns `encoding=None` directly for the same inputs, with no false positives observed.
 
 ### Encoding Aliases
 
@@ -107,6 +89,89 @@ def normalize_encoding(enc: str) -> str:
 Returning the dash-stripped form (`"windows1251"`, `"windows1252"`, `"iso88591"`) breaks codec lookup. Python's codec normalizer replaces `-` with `_` but cannot recover a missing separator: `windows-1251` / `windows_1251` / `cp1251` all resolve to the cp1251 codec, but `windows1251` raises `LookupError`.
 
 The aliased path (gb2312 → gbk, iso-8859-1 → windows-1252) was unaffected because the alias value is returned verbatim with its dashes intact. Direct chardet hits on `windows-1252` silently failed in `convert_file` until [#3](https://github.com/ymonster/claude_encoding_guard/pull/3) added windows-1251 to RESTORE_ENCODINGS and exposed the same pattern across every Cyrillic test size — surfacing the latent bug for both encodings simultaneously.
+
+## chardet 7.x Migration Findings
+
+This branch (`chardet7-preview`) was prototyped to evaluate replacing chardet 5.x + binaryornot with chardet 7.x's built-in pipeline. The harness (`_backup/pr_test_harness.py`) reports 73/73 fixtures PASS — same as `main`'s 5.x baseline. What follows is the empirical rationale for the design choices that got there.
+
+### Detection Strategy (`detect_safely`)
+
+```python
+# 1. Empty input → utf-8 (handled before this function)
+# 2. Pure-ASCII short-circuit (all bytes < 0x80) → skip
+# 3. chardet.detect(data,
+#                   encoding_era=EncodingEra.MODERN_WEB,
+#                   prefer_superset=True)
+# 4. encoding == None         → binary, skip (stage 5 cut)
+# 5. encoding == "utf-8"      → already converted, skip
+# 6. _strip_enc not in RESTORE→ unsupported encoding, skip
+# 7. confidence < 0.10        → noise, skip
+# 8. otherwise → return encoding
+```
+
+No `>= 0.30 / >= 0.60 / gap >= 0.10` thresholds, no STRUCTURAL_TRUSTED bypass, no binaryornot. The 0.10 floor is purely to drop `cp1006`/`IBM855`-class flukes; everything else is delegated to chardet 7.x's own filtering layers.
+
+### Why no high confidence threshold?
+
+7.x's confidence is **cosine similarity** in the bigram-frequency space, not a calibrated probability. Empirically (5KB samples):
+
+| Encoding | 7.x confidence | Why |
+|---|---|---|
+| GB18030 | 0.14–0.25 | Largest bigram inventory in the model — geometrically pinned low |
+| Big5 | 0.37–0.40 | Second-largest bigram inventory |
+| GBK | 0.59–0.67 | Smaller inventory, higher score |
+| EUC-JP / Shift_JIS / EUC-KR / Cyrillic / cp1252 | 0.6–0.95 | Smaller inventories or distinctive byte patterns |
+
+A 0.30 floor would silently skip every GB18030 file regardless of length. A 0.60 floor would also drop Big5. The fix is not "raise the threshold" — it's "trust the structural layers that come before scoring."
+
+### Why no manual binary check?
+
+chardet 7.x's pipeline stage 5 returns `encoding=None` for non-text input at confidence 0.95–1.00, and this verdict is independent of `ignore_threshold`. Empirically across PoC fixtures (`bin_random_*`, `bin_png`, `bin_jpeg`, `bin_pe_head`, `bin_gzip`, `bin_adversarial_cjk`):
+
+| Binary fixture | Result |
+|---|---|
+| 200B–5KB random bytes | None(0.95) |
+| Minimal PNG / JPEG / PE / gzip | None(1.00) |
+| Adversarial: random + GBK chunk | None(0.95) |
+
+No false positives. binaryornot's known false positives on `_backup/cp1251_test/test.c` (115B mixed CP1251 source) and short Shift_JIS/EUC-JP files do not occur with chardet 7.x.
+
+### Why `EncodingEra.MODERN_WEB`?
+
+chardet 7.x ships 99 encoding probers spread across MODERN_WEB / LEGACY_ISO / LEGACY_MAC / LEGACY_REGIONAL / DOS / MAINFRAME eras. Restricting to MODERN_WEB shrinks the candidate space to web-relevant encodings (UTF-*, Windows-125x, CP874, KOI8-*, CJK multibyte) without losing anything we support.
+
+### Why `prefer_superset=True`?
+
+For superset/subset sibling pairs, raw 7.x can return both at identical confidence (e.g., on a 49-byte EUC-KR fixture: `[CP949(0.58), EUC-KR(0.58)]`). With `prefer_superset=True` the subset is collapsed onto its superset, eliminating tied gaps that would break a gap-based heuristic. We don't use a gap heuristic any more, but the collapse also gives us cleaner Python codec semantics: `cp949` is a strict superset of `euc-kr`, so its codec round-trip is more permissive.
+
+### Why an explicit ASCII short-circuit?
+
+chardet 7.x reports any pure-ASCII content as `Windows-1252(1.00)` because ASCII is a cp1252 subset and the bigram model has no positive ASCII signal. Converting these as cp1252 is a no-op round-trip but still mutates the file and writes a cache entry, breaking the "ASCII files should be invisible to the hook" expectation. A 5-line `all(b < 0x80 for b in data)` check upstream of `chardet.detect` skips them cleanly. Setting `no_match_encoding="ascii"` does **not** help — that parameter is for "no candidate survived," not for "ASCII matched cp1252 perfectly."
+
+### Codec name conventions
+
+7.x's `compat_names=True` default still returns chardet 7.x canonical names for some codecs:
+
+| 5.x name (chardet) | 7.x name (chardet 7.4.3, default) | Python codec status |
+|---|---|---|
+| `gbk` / `gb2312` (per-input) | `GB18030` (always, regardless of input) | strict superset, accepts both |
+| `shift_jis` | `cp932` | strict superset |
+| `euc-kr` | `CP949` | strict superset |
+| `Big5`, `Big5-HKSCS`, `EUC-JP`, `ISO-2022-JP`, `Windows-125x`, `ISO-8859-*` | unchanged | — |
+
+We rely on the fact that Python's codec registry accepts the 7.x names directly, and a superset codec correctly round-trips bytes that were originally encoded under its subset codec. So we add `cp932`, `CP949`, `GB18030` to RESTORE_ENCODINGS and never need to remap names back to IANA originals.
+
+### `EUC-TW` not supported by chardet 7.x
+
+`EUC-TW` exists in our `RESTORE_ENCODINGS` set as a defensive holdover, but chardet 7.x has no EUC-TW prober. Passing it via `include_encodings=...` raises `Unknown encoding 'EUC-TW'`. Real files in EUC-TW are rare; we keep the entry so a 5.x fallback still recognizes it, but on this branch chardet will never return it.
+
+### Why `detect()` not `detect_all()`?
+
+Reading chardet's source: `detect()` is `run_pipeline(...)[0].to_dict()` plus optional `prefer_superset` / `compat_names` post-processing. `detect_all()` returns the full list and adds an `ignore_threshold` knob. Since our strategy doesn't read `results[1:]` for any cross-candidate logic and we want the equivalent of `ignore_threshold=True` (let our own 0.10 floor decide), `detect()` is the precise tool — same shaping params, no wasted `to_dict` work, intent is clear at the call site.
+
+### License
+
+chardet 7.x is **0BSD**-licensed (chardet 5.x was LGPL-2.1+). The plugin itself remains MIT. With `binaryornot` (BSD-3-Clause) dropped on this branch, runtime dependencies are now uniformly permissive — no LGPL-style "user must be able to swap library" obligation, even though `uv run --script` already satisfied it.
 
 ## Cache Design
 

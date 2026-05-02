@@ -1,8 +1,62 @@
-# claude_encoding_guard
+# claude_encoding_guard (chardet 7.x 实验版)
+
+> [!WARNING]
+> **这是 `chardet7-preview` 实验分支。** 稳定版本在 [`main`](https://github.com/ymonster/claude_encoding_guard/tree/main) 分支。本分支仅用于测试 chardet 7.x 迁移或贡献反馈。
 
 Claude Code 编辑文件时，自动保留非 UTF-8 编码和行尾符。
 
 [English](README.md)
+
+## 与 `main` 的差异
+
+| 维度 | `main` (5.x) | `chardet7-preview` |
+|---|---|---|
+| chardet 版本 | `>=5,<6` (LGPL-2.1+) | `>=7,<8` (0BSD) |
+| `binaryornot` 依赖 | 必需 | **去除** —— chardet 7.x 内置 stage 5 binary detection |
+| 置信度阈值 | 每编码 `>= 0.5` | `>= 0.10` 噪声底线（7.x cosine 几何评分，非贝叶斯） |
+| ASCII 处理 | chardet 5.x 自然识别 | 显式短路（7.x 把 ASCII 报为 Windows-1252） |
+| `STRUCTURAL_TRUSTED` 旁路 | 有（binaryornot 对短 CJK / 混合 Cyrillic 误判） | 不需要（stage 5 无类似 FP） |
+| codec 名 | `gbk` / `shift_jis` / `euc-kr` | `GB18030` / `cp932` / `CP949`（superset codec，round-trip 更宽容） |
+| 测试 harness 结果 | 73/73 PASS | 73/73 PASS |
+
+详见 [TECHNICAL.md](TECHNICAL.md) → "chardet 7.x Migration Findings"。
+
+## 安装（实验分支）
+
+Claude Code plugin marketplace 不支持指定 GitHub 源的分支，需要手动安装：
+
+```bash
+git clone -b chardet7-preview https://github.com/ymonster/claude_encoding_guard
+```
+
+然后在项目的 `.claude/settings.local.json` 里指向克隆出来的 `hooks/encoding_guard.py`：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Read|Edit|Write",
+      "hooks": [{
+        "type": "command",
+        "command": "uv run --script <clone-path>/hooks/encoding_guard.py pre"
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "Edit|Write",
+      "hooks": [{
+        "type": "command",
+        "command": "uv run --script <clone-path>/hooks/encoding_guard.py post"
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "uv run --script <clone-path>/hooks/encoding_guard.py restore-all"
+      }]
+    }]
+  }
+}
+```
 
 ## 问题
 
@@ -15,11 +69,14 @@ Claude Code 的 Edit/Write 工具始终输出 UTF-8 + LF 行尾。编辑 GBK、B
 ```
 PreToolUse (Read)                       PostToolUse (Edit/Write)
     │                                        │
-    ├─ 二进制检测 (binaryornot)               ├─ 读取缓存的编码 + 行尾风格
-    ├─ 检测编码 (chardet 5.x)                ├─ UTF-8 → 原始编码
-    ├─ 检测行尾 (CRLF/LF)                   ├─ 恢复行尾符
-    ├─ 原始编码 → UTF-8                      ├─ 删除会话缓存
-    ├─ 保存会话缓存                           └─ 完成
+    ├─ ASCII 短路                            ├─ 读取缓存的编码 + 行尾风格
+    ├─ 检测编码 (chardet 7.x)                ├─ UTF-8 → 原始编码
+    │   ├─ stage 5 binary detection         ├─ 恢复行尾符
+    │   ├─ era=MODERN_WEB 候选限定           ├─ 删除会话缓存
+    │   └─ prefer_superset=True             └─ 完成
+    ├─ 检测行尾 (CRLF/LF)
+    ├─ 原始编码 → UTF-8
+    ├─ 保存会话缓存
     └─ Claude 读到正确内容
 ```
 
@@ -29,37 +86,20 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 
 - **编码保护**：GBK、GB2312、GB18030、Big5、Big5-HKSCS、EUC-TW、Shift_JIS、EUC-JP、ISO-2022-JP、EUC-KR、Windows-1252、ISO-8859-1
 - **行尾保护**：Claude Code 将 CRLF 转为 LF 后自动恢复
-- **二进制文件防护**：防止 chardet 误判二进制文件导致数据损坏（始终开启，不可关闭）
+- **二进制文件防护**：chardet 7.x 内置 stage 5 binary detection（始终开启）
 - **会话隔离**：多个 Claude Code 会话互不干扰
 - **零配置**：安装即用
 
-## 安装
-
-### 前置要求
-
-- [uv](https://docs.astral.sh/uv/) — 必需。通过 PEP 723 inline metadata 自动管理 Python 依赖，无需手动 `pip install`。
-
-### 作为 Plugin 安装
-
-```
-/plugin marketplace add ymonster/claude_encoding_guard
-/plugin install encoding-guard
-```
-
 ### 验证
 
-安装后，Read 任意非 UTF-8 文件——中文应正确显示而非乱码。
-
-### 实验性：chardet 7.x 分支
-
-迁移到 chardet 7.x 的原型在 [`chardet7-preview`](https://github.com/ymonster/claude_encoding_guard/tree/chardet7-preview) 分支上。它去掉了 `binaryornot` 依赖（chardet 7.x 内置 binary detection），并用上了 0BSD 许可的 chardet（5.x 是 LGPL）。暂不推荐日常使用，详见该分支 README 的状态与安装说明。
+按上面 "安装（实验分支）" 步骤接好 hooks 后，Read 任意非 UTF-8 文件——中文应正确显示而非乱码。
 
 ## 设计决策
 
 - **Read 阶段转换**：Claude Code v2.1.90+ 对 hook 修改的文件不重新读取内容。Edit 阶段转换会导致 U+FFFD 覆盖。Read 阶段转换确保 Claude 第一次看到的就是正确 UTF-8。
 - **`uv run --script`**：普通 `uv run` 触发项目 sync 会关闭 Windows 上的 stdin 管道。`--script` 跳过项目发现。
-- **chardet 5.x**：7.x 对 CJK 检测置信度从 0.99 降到 0.40——低于安全阈值。通过 PEP 723 锁定在隔离环境中。
-- **二进制检测**：chardet 将某些二进制误判为 Windows-1252（0.73 置信度）。[binaryornot](https://github.com/binaryornot/binaryornot) 过滤。始终开启，不可关闭。
+- **chardet 7.x**：置信度模型重写为 cosine similarity 评分（不再是"我有多确定"，而是"判定路径有多硬"）。GB18030 由于 bigram 集合最大，几何上 confidence 永远在 0.14–0.25，与文件大小无关——所以我们用 0.10 噪声底线 + 白名单过滤，而非高置信度阈值。详见 [TECHNICAL.md](TECHNICAL.md)。
+- **二进制检测**：chardet 7.x pipeline stage 5 在非文本输入上返回 `encoding=None`，confidence 0.95–1.00，替代了 `main` 分支的 binaryornot 决策树。测试 fixture 集上未观察到误判。
 - **编码别名**：GB2312 → GBK（字节兼容超集），ISO-8859-1 → Windows-1252（行业惯例）。
 - **会话隔离缓存**：`<tmpdir>/.cc_encoding_cache/<session_id>/`——不跨会话干扰。24 小时自动清理残留。
 

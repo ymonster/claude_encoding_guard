@@ -1,8 +1,62 @@
-# claude_encoding_guard
+# claude_encoding_guard (chardet 7.x experimental)
+
+> [!WARNING]
+> **This is the `chardet7-preview` experimental branch.** Stable releases live on [`main`](https://github.com/ymonster/claude_encoding_guard/tree/main). Use this branch only for testing the chardet 7.x migration or contributing feedback.
 
 Preserve non-UTF-8 file encodings and line endings when Claude Code edits your files.
 
 [中文文档](README_CN.md)
+
+## What's different from `main`
+
+| Aspect | `main` (5.x) | `chardet7-preview` |
+|---|---|---|
+| chardet version | `>=5,<6` (LGPL-2.1+) | `>=7,<8` (0BSD) |
+| `binaryornot` dependency | required | **dropped** — chardet 7.x stage 5 binary detection replaces it |
+| Confidence threshold | `>= 0.5` per-encoding | `>= 0.10` noise floor (7.x cosine-similarity scoring is geometric, not Bayesian) |
+| ASCII handling | natural via chardet 5.x | explicit short-circuit (7.x reports ASCII as Windows-1252) |
+| `STRUCTURAL_TRUSTED` bypass | yes (binaryornot has FPs on short CJK / mixed Cyrillic) | not needed (stage 5 has no comparable FPs) |
+| Codec name conventions | `gbk` / `shift_jis` / `euc-kr` | `GB18030` / `cp932` / `CP949` (superset codecs, more permissive round-trip) |
+| Test harness result | 73/73 fixtures PASS | 73/73 fixtures PASS |
+
+See [TECHNICAL.md](TECHNICAL.md) → "chardet 7.x Migration Findings" for the empirical rationale and corner-case catalog.
+
+## Install (experimental branch)
+
+The Claude Code plugin marketplace doesn't support specifying a branch when installing from a GitHub source, so manual setup is required:
+
+```bash
+git clone -b chardet7-preview https://github.com/ymonster/claude_encoding_guard
+```
+
+Then point your project's `.claude/settings.local.json` at the cloned `hooks/encoding_guard.py`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Read|Edit|Write",
+      "hooks": [{
+        "type": "command",
+        "command": "uv run --script <clone-path>/hooks/encoding_guard.py pre"
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "Edit|Write",
+      "hooks": [{
+        "type": "command",
+        "command": "uv run --script <clone-path>/hooks/encoding_guard.py post"
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "uv run --script <clone-path>/hooks/encoding_guard.py restore-all"
+      }]
+    }]
+  }
+}
+```
 
 ## The Problem
 
@@ -15,11 +69,14 @@ Related issues: [#6485](https://github.com/anthropics/claude-code/issues/6485), 
 ```
 PreToolUse (Read)                       PostToolUse (Edit/Write)
     │                                        │
-    ├─ binary check (binaryornot)            ├─ read cached encoding + line ending
-    ├─ detect encoding (chardet 5.x)         ├─ convert UTF-8 → original encoding
-    ├─ detect line ending (CRLF/LF)          ├─ normalize line endings to original
-    ├─ convert original → UTF-8              ├─ delete session cache
-    ├─ save session cache                    └─ done
+    ├─ ASCII short-circuit                   ├─ read cached encoding + line ending
+    ├─ detect encoding (chardet 7.x)         ├─ convert UTF-8 → original encoding
+    │   ├─ stage 5 binary detection          ├─ normalize line endings to original
+    │   ├─ era=MODERN_WEB candidates         ├─ delete session cache
+    │   └─ prefer_superset=True              └─ done
+    ├─ detect line ending (CRLF/LF)
+    ├─ convert original → UTF-8
+    ├─ save session cache
     └─ Claude reads correct content
 ```
 
@@ -29,37 +86,20 @@ Conversion happens at **Read time**, before Claude Code loads the file into memo
 
 - **Encoding preservation**: GBK, GB2312, GB18030, Big5, Big5-HKSCS, EUC-TW, Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, Windows-1252, Windows-1251 (Cyrillic), ISO-8859-1
 - **Line ending preservation**: CRLF restored after Claude Code converts to LF
-- **Binary file protection**: Prevents chardet from misidentifying binary files (always on, not configurable)
+- **Binary file protection**: chardet 7.x's built-in stage 5 binary detection (always on)
 - **Session isolation**: Multiple Claude Code sessions won't interfere with each other
 - **Zero configuration**: Works out of the box
 
-## Install
-
-### Prerequisites
-
-- [uv](https://docs.astral.sh/uv/) — required. Handles Python dependencies automatically via PEP 723 inline metadata. No manual `pip install` needed.
-
-### As Plugin
-
-```
-/plugin marketplace add ymonster/claude_encoding_guard
-/plugin install encoding-guard
-```
-
 ### Verify
 
-After installation, Read any non-UTF-8 file — Chinese characters should display correctly instead of garbled text.
-
-### Experimental: chardet 7.x branch
-
-A migration to chardet 7.x is being prototyped on the [`chardet7-preview`](https://github.com/ymonster/claude_encoding_guard/tree/chardet7-preview) branch. It drops the `binaryornot` dependency (chardet 7.x has built-in binary detection) and uses 0BSD-licensed chardet (vs LGPL on 5.x). Not recommended for daily use yet — see the branch's README for status and install instructions.
+After install, Read any non-UTF-8 file — Chinese characters should display correctly instead of garbled text.
 
 ## Design Decisions
 
 - **Read-time conversion**: Claude Code v2.1.90+ silently accepts hook-modified files without re-reading content. Edit-time conversion results in U+FFFD corruption. Converting at Read time ensures Claude's first in-memory view is correct.
 - **`uv run --script`**: Plain `uv run` triggers project sync which closes the stdin pipe on Windows. `--script` skips project discovery.
-- **chardet 5.x**: Version 7.x reduced CJK detection confidence from 0.99 to 0.40 — below the safety threshold. Pinned via PEP 723 in an isolated environment.
-- **Binary detection**: chardet misidentifies some binary files as Windows-1252 (confidence 0.73). [binaryornot](https://github.com/binaryornot/binaryornot) filters these out. Always on, not configurable.
+- **chardet 7.x**: Confidence is recalibrated to cosine-similarity scoring (no longer "how confident I am" but "how hard the detection method was"). GB18030 confidence is geometrically pinned to 0.14–0.25 regardless of input length, so we use a 0.10 noise floor + allowlist filter rather than a high confidence threshold. See [TECHNICAL.md](TECHNICAL.md) for details.
+- **Binary detection**: chardet 7.x's pipeline stage 5 returns `encoding=None` for non-text inputs at confidence 0.95–1.00, replacing the binaryornot decision tree used on `main`. No false positives observed across the test fixture set.
 - **Encoding aliases**: GB2312 → GBK (byte-compatible superset), ISO-8859-1 → Windows-1252 (industry practice).
 - **Session-isolated cache**: `<tmpdir>/.cc_encoding_cache/<session_id>/` — no cross-session interference. Stale sessions (>24h) auto-cleaned.
 
