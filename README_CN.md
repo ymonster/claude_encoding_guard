@@ -105,6 +105,8 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 
 ## 已知限制
 
+- **二进制文件误编辑的兜底建议。** 我们已经尽量通过各种手段规避对二进制文件的编辑（绝大多数场景下 Claude Code 不会去编辑一个 binary 文件），但总是有可能有疏漏。考虑过用 local git 自动 stash 做兜底，但担心会影响用户自己的 git workflow（污染 stash list、reflog 等）。所以这里强烈建议在 git 或其他版本控制工具下使用本插件，一旦真出现了问题保证可以恢复。
+
 - **Windows-1252 stale cache 边界情况。** 如果缓存删除失败（如杀毒软件锁定）且文件原始 Windows-1252 字节恰好是合法 UTF-8，残留缓存无法自愈。此情况需要两个极端条件同时满足，不影响 CJK 编码（GBK/Big5/Shift_JIS 字节不是合法 UTF-8）。
 
 - **混合行尾。** 同时包含 CRLF 和 LF 的文件会恢复为主要风格。

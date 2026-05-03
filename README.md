@@ -105,6 +105,8 @@ After install, Read any non-UTF-8 file — Chinese characters should display cor
 
 ## Known Limitations
 
+- **Recommended: use under version control as a fallback for binary misedits.** We do our best to avoid editing binary files through multiple defensive layers (and in practice Claude Code rarely tries to edit a binary file anyway), but stray cases are always possible. We considered using local `git stash` as an automatic fallback but didn't want to interfere with the user's own git workflow (polluting stash list, reflog, etc.). So **strongly recommended: use this plugin under git or another version control tool**, so any misidentification can be safely rolled back.
+
 - **Windows-1252 stale cache edge case.** If cache deletion fails (e.g., antivirus lock) and the file's original Windows-1252 bytes happen to be valid UTF-8, the stale cache won't self-heal. This requires two unlikely conditions to coincide and doesn't affect CJK encodings (GBK/Big5/Shift_JIS bytes are not valid UTF-8).
 
 - **Mixed line endings.** Files with both CRLF and LF are normalized to the dominant style.
