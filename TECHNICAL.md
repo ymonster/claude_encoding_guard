@@ -239,3 +239,115 @@ All file writes use `atomic_write()`:
 3. `os.replace()` atomically replaces the original
 
 If step 2 or 3 fails, the temp file is cleaned up and the original file is preserved. This prevents data loss from disk-full errors, process interruption, or permission issues.
+
+## Hook Behavior Reference
+
+Empirically verified against Claude Code 2.1.132 via an instrumented log-only hook in a separate playground project. Documented here as a stable reference for future hook design (read-only redirect, raw-byte backup, ACL gate, etc.).
+
+### Hook stdin schemas (observed shapes)
+
+`PreToolUse` for `Read`:
+```json
+{
+  "session_id": "...",
+  "transcript_path": "C:\\Users\\...\\<session_id>.jsonl",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {"file_path": "..."},
+  "tool_use_id": "toolu_..."
+}
+```
+
+`PostToolUse` for `Read`:
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {"file_path": "..."},
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "...",
+      "content": "...",
+      "numLines": 2,
+      "startLine": 1,
+      "totalLines": 2
+    }
+  },
+  "tool_use_id": "toolu_...",
+  "duration_ms": 6
+}
+```
+
+`Stop`:
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "..."
+}
+```
+
+`tool_use_id` is the natural correlation key between a Pre and its matching Post invocation. The hook also has `CLAUDE_PROJECT_DIR` set as an env var (project-relative `cwd` for the running CC instance).
+
+### `updatedInput` semantics — "swap engine, keep facade"
+
+When `PreToolUse` returns `hookSpecificOutput.updatedInput` together with `permissionDecision: "allow"`, the modified input takes effect for the actual tool execution but Claude is not informed of the change. Verified for `Read` with `file_path` redirect:
+
+| Channel | Sees | Notes |
+|---|---|---|
+| Pre stdin | **original** input | Pre's chance to decide whether/how to modify |
+| Tool execution | **updated** input | What CC actually runs |
+| Post stdin (`tool_input`) | **updated** input | Reflects the post-modification state |
+| Post stdin (`tool_response`) | result of running on **updated** input | e.g., content of the redirected file |
+| Transcript `tool_use.input` (Claude's record) | **original** input | Claude believes it called what it asked for |
+| `tool_result.content` returned to Claude | result of running on **updated** input | Claude sees the resulting bytes |
+
+So a hook can transparently re-route or normalize a tool call without polluting Claude's mental model of what it did. The only signal Claude can pick up is content-level: if Claude reads the same path twice and sees different bytes, it can infer "something changed" but not "the path was redirected."
+
+The empirical setup that produced this: `PreToolUse(Read("orig.txt"))` returning `updatedInput.file_path = "redirect.txt"` resulted in CC reading `redirect.txt`'s content, Claude receiving that content, but Claude's transcript `tool_use.input.file_path` still showing `orig.txt`. Both `Pre` and `Post` hook stdin showed exactly what the columns above describe.
+
+### Version requirements
+
+`hookSpecificOutput.updatedInput` (with `permissionDecision: "allow"`) is supported since at least Claude Code **2.1.0**. The 2.1.0 CHANGELOG entry is a fix for an `ask`-decision edge case, indicating the feature predates 2.1.0; the modern `hookSpecificOutput` schema has been stable since at least early 2.1.x. The plugin's existing reliance on `${CLAUDE_PLUGIN_ROOT}` and stdin JSON shape already implies `≥ 2.1.0` so adding `updatedInput` use does not raise the floor in practice.
+
+### Edit vs Write semantic differences
+
+| Dimension | `Edit` | `Write` |
+|---|---|---|
+| File existence | Must exist; CC also enforces "must have been Read" in the same session | May not exist (creates) or may exist (overwrites) |
+| Modification mode | Surgical: replace `old_string` with `new_string` | Full: replace entire content |
+| Failure modes | `old_string` not found / matches multiple times | Disk errors only (rare) |
+| Typical input fields | `{file_path, old_string, new_string}` | `{file_path, content}` |
+
+For an encoding-handling plugin: `Edit` and `Write` on **existing** non-UTF-8 files share the same handling path (detect encoding, convert, do the operation, restore). `Write` on a **non-existent** file is a special case — there is no original encoding to detect, and the new file is naturally created as UTF-8.
+
+### Failure-mode safety: how the original file is protected
+
+Two architecturally distinct ways a hook plugin can keep the original bytes safe when a tool call fails:
+
+**(a) In-place convert + reverse (current main + chardet7-preview architecture)**: Pre converts the original file in place to UTF-8, Post converts back. If the tool fails without modifying content, the round-trip is byte-identical. Safety relies on a mathematical equivalence (`encode(decode(bytes)) == bytes`). Pre's `convert_file` aborts on `UnicodeDecodeError` so a wrong-encoding detection is caught before any write. The original file's `mtime` changes twice per Read/Edit cycle, which is visible to external watchers (IDEs, build daemons).
+
+**(b) Redirect to temp + sync-back on success (Solution 2 design, not yet implemented)**: Pre creates a fresh temp UTF-8 file and `updatedInput`s the path to it; the original is not touched. Post syncs back only on tool success; on failure, the temp is discarded and the original remains literally byte-identical with unchanged `mtime`. Safety is structural (Pre never writes the original) rather than mathematical. External watchers see at most one `mtime` bump per successful Edit/Write.
+
+A failed tool — `Edit` with non-matching `old_string`, `Write` with disk error, etc. — leaves the original file's content intact under either architecture. Architecture (b) additionally preserves the `mtime`/`inode`-level invariants and gives stronger safety when Post itself encounters an error (e.g., reverse-encode failure due to characters Claude introduced that aren't representable in the original encoding — currently a known limitation in (a)).
+
+### Open empirical gaps
+
+These have not been verified by experiment yet (deferred until needed):
+
+- `tool_response` schema for `Edit` / `Write` on success
+- `tool_response` schema for `Edit` / `Write` on failure (specifically, whether there is an explicit success/error field that hooks can branch on)
+- Pre/Post stdin `tool_input` shape for `Edit` (`old_string` / `new_string` field names) and `Write` (`content`)
+- Whether `PostToolUse` fires when the tool itself errors out (vs only on success)
+- Whether `Write` to a non-existent path triggers Pre with the path that doesn't exist yet (assumed yes)
