@@ -139,6 +139,8 @@ Thanks to [@lbresler](https://github.com/lbresler) for [#1](https://github.com/y
 
 Thanks to [@Pacman766](https://github.com/Pacman766) for [#3](https://github.com/ymonster/claude_encoding_guard/pull/3) (Windows-1251 / CP1251 support for Cyrillic text).
 
+Thanks to [@albert-polak](https://github.com/albert-polak) for [#4](https://github.com/ymonster/claude_encoding_guard/pull/4) (Windows-1250 / CP1250 support for Central European text).
+
 ## License
 
 MIT
