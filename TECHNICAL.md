@@ -220,6 +220,93 @@ Empirically verified against Claude Code 2.1.132 via an instrumented log-only ho
 }
 ```
 
+`PreToolUse` for `Edit`:
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "...",
+    "old_string": "...",
+    "new_string": "...",
+    "replace_all": false
+  },
+  "tool_use_id": "toolu_..."
+}
+```
+
+`PostToolUse` for `Edit` (on success only — failures bypass the hook chain; see "Client-side validation" below):
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {"file_path": "...", "old_string": "...", "new_string": "...", "replace_all": false},
+  "tool_response": {
+    "filePath": "...",
+    "oldString": "...",
+    "newString": "...",
+    "originalFile": "<full file content before Edit>",
+    "structuredPatch": [
+      {"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+       "lines": ["-old", "+new"]}
+    ],
+    "userModified": false,
+    "replaceAll": false
+  },
+  "tool_use_id": "toolu_...",
+  "duration_ms": 21
+}
+```
+
+Note the case mismatch: `tool_input` uses `snake_case` (`file_path`, `old_string`) while `tool_response` uses `camelCase` (`filePath`, `oldString`). This pattern holds for both `Edit` and `Write`.
+
+`PreToolUse` for `Write`:
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {"file_path": "...", "content": "..."},
+  "tool_use_id": "toolu_..."
+}
+```
+
+`PostToolUse` for `Write` (on success — `type` is `"create"` for a new file, `"update"` when overwriting an existing file):
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Write",
+  "tool_input": {"file_path": "...", "content": "..."},
+  "tool_response": {
+    "type": "create",
+    "filePath": "...",
+    "content": "<written content>",
+    "structuredPatch": [],
+    "originalFile": null,
+    "userModified": false
+  },
+  "tool_use_id": "toolu_...",
+  "duration_ms": 14
+}
+```
+
+For `Write` overwriting an existing file (`type: "update"`), `originalFile` is the file's full content before the overwrite and `structuredPatch` contains the diff.
+
 `Stop`:
 ```json
 {
@@ -233,7 +320,7 @@ Empirically verified against Claude Code 2.1.132 via an instrumented log-only ho
 }
 ```
 
-`tool_use_id` is the natural correlation key between a Pre and its matching Post invocation. The hook also has `CLAUDE_PROJECT_DIR` set as an env var (project-relative `cwd` for the running CC instance).
+`tool_use_id` is the natural correlation key between a Pre and its matching Post invocation. The hook also has `CLAUDE_PROJECT_DIR` set as an env var (project-relative `cwd` for the running CC instance). `duration_ms` appears in `Post` only.
 
 ### `updatedInput` semantics — "swap engine, keep facade"
 
@@ -252,6 +339,8 @@ So a hook can transparently re-route or normalize a tool call without polluting 
 
 The empirical setup that produced this: `PreToolUse(Read("orig.txt"))` returning `updatedInput.file_path = "redirect.txt"` resulted in CC reading `redirect.txt`'s content, Claude receiving that content, but Claude's transcript `tool_use.input.file_path` still showing `orig.txt`. Both `Pre` and `Post` hook stdin showed exactly what the columns above describe.
 
+**Caveat — `updatedInput` cannot redirect Edit/Write on existing files**: although the redirect mechanics work end-to-end for `Read`, the same redirect on `Edit`/`Write`-existing fails *before* the hook is invoked, due to the `readFiles`-tracker asymmetry described in "Asymmetric `readFiles` tracking" below. As of CC 2.1.132, `updatedInput` is effective only for tools whose client-side preconditions are either absent (e.g., `Read`, `Bash`) or already satisfied independently of the redirect (e.g., new-file `Write`).
+
 ### Version requirements
 
 `hookSpecificOutput.updatedInput` (with `permissionDecision: "allow"`) is supported since at least Claude Code **2.1.0**. The 2.1.0 CHANGELOG entry is a fix for an `ask`-decision edge case, indicating the feature predates 2.1.0; the modern `hookSpecificOutput` schema has been stable since at least early 2.1.x. The plugin's existing reliance on `${CLAUDE_PLUGIN_ROOT}` and stdin JSON shape already implies `≥ 2.1.0` so adding `updatedInput` use does not raise the floor in practice.
@@ -260,29 +349,131 @@ The empirical setup that produced this: `PreToolUse(Read("orig.txt"))` returning
 
 | Dimension | `Edit` | `Write` |
 |---|---|---|
-| File existence | Must exist; CC also enforces "must have been Read" in the same session | May not exist (creates) or may exist (overwrites) |
-| Modification mode | Surgical: replace `old_string` with `new_string` | Full: replace entire content |
-| Failure modes | `old_string` not found / matches multiple times | Disk errors only (rare) |
-| Typical input fields | `{file_path, old_string, new_string}` | `{file_path, content}` |
+| File existence | Must exist | May not exist (creates new) or exist (overwrites) |
+| Read precondition | Must have been Read in current session before Edit (else CC fails the call before any hook fires) | Only when target exists: must have been Read in current session (Write tool prompt v2.1.120+ says "or the call will fail"). New-file creation has no Read precondition. |
+| Modification mode | Surgical: replace `old_string` with `new_string` (optionally all occurrences via `replace_all`) | Full: replace entire content |
+| Client-side fail-fast paths | `old_string` not found / matches multiple times; stale-detection (file content changed externally since Read); Read precondition unsatisfied | Stale-detection on existing target; Read precondition unsatisfied for existing target |
+| `tool_response.type` field | (none) | `"create"` (new file) or `"update"` (overwrote existing) |
+| Typical `tool_input` fields | `{file_path, old_string, new_string, replace_all}` | `{file_path, content}` |
 
-For an encoding-handling plugin: `Edit` and `Write` on **existing** non-UTF-8 files share the same handling path (detect encoding, convert, do the operation, restore). `Write` on a **non-existent** file is a special case — there is no original encoding to detect, and the new file is naturally created as UTF-8.
+For an encoding-handling plugin: `Edit` and `Write` on **existing** non-UTF-8 files share the same handling path (detect encoding, convert, do the operation, restore). `Write` on a **non-existent** file is a special case — there is no original encoding to detect, and the new file is naturally created as UTF-8. `Bash` tool calls that write to files (`sed -i`, `>`, `>>`, `vim`, etc.) bypass the `Edit`/`Write` hook chain entirely and are outside any encoding plugin's reach (see "Read-first invariant" below).
+
+### Client-side validation (preempts the hook chain)
+
+CC performs a series of validations on the model's tool call **before** invoking the `PreToolUse` hook chain. If any validation fails, CC generates an error `tool_result` for the model and **never fires `PreToolUse` or `PostToolUse`**. The TUI still renders an `Update(file)` / `Write(file)` line followed by `⎿  Error editing file` (or a more specific message) so the user sees something happened, but no hook log entry is produced and no `updatedInput` redirect is possible at that point.
+
+Empirically observed validations on `Edit` / `Write`:
+
+| Validation | Trigger | TUI display | LLM error indication | Hook fires? |
+|---|---|---|---|---|
+| `old_string` content check (Edit) | `old_string` doesn't appear in current file content | `Update(file) ⎿ Error editing file` | LLM concludes "string not present" from the response | ✗ |
+| Stale-detection (content hash) | File content changed externally since the last Read in this session — even within the same session, even between two prompts in the same session | Same | "file has been modified externally; must re-Read" | ✗ |
+| Read precondition | `Edit`/`Write`-existing on a file not in the session's `readFiles` set | `Update(file) ⎿ File must be read first` / `Write(file) ⎿ Error writing file` | "File must be read first" / "File has not been read yet" | ✗ |
+
+All three validations have been **directly observed** to skip the hook chain. The `old_string` and stale paths were verified by forcing the model to issue an `Edit` whose preconditions cannot be satisfied (`old_string` literally not in the file; or rewriting the file content externally between Read and Edit). The Read-precondition path was verified by the dual-redirect experiment described in "Asymmetric `readFiles` tracking" below.
+
+Important consequence for hook plugins: a hook **cannot** intercept these failures, cannot inspect the failed call, and cannot compensate. From the hook's perspective, the call simply never happened. This rules out any design where the hook would `updatedInput`-redirect the file path *after* CC has already validated against the original path's content — by the time the hook would see the call, CC has already short-circuited it.
+
+The above is about CC's *internal* validation. A tool that **passes** validation, fires `PreToolUse`, then errors during its own execution (e.g., disk full, encoding write error) is a separate case — whether `PostToolUse` fires for that path is still an open empirical gap.
+
+### Asymmetric `readFiles` tracking
+
+Inside CC there is a session-scoped set of "files that have been Read this session", used by the Read-precondition check above. Empirically, **this set is populated and queried using two different paths when a `PreToolUse` hook redirects via `updatedInput.file_path`**:
+
+- **Read** populates the set using the **post-redirect** path (the path the tool actually executed against).
+- **Edit** / **Write** Read-precondition checks the set using the **pre-redirect** path (the path the model passed in `tool_input`, before any hook intervention).
+
+These two paths are different exactly when a hook redirects, so the two ends never align, and `updatedInput` cannot transparently rescue an Edit/Write that targets the original (pre-redirect) path.
+
+Controlled experiment (Claude Code 2.1.132):
+
+- Fixture: `orig.txt = "ORIG_PHYSICAL"`, `redirect.txt = "REDIRECTED_VIA_HOOK"` (distinct contents).
+- Single `PreToolUse` hook with matcher `*`: when `tool_input.file_path` basename equals `orig.txt`, return `updatedInput.file_path = ".../redirect.txt"`. The same redirect is structurally applied to `Read`, `Edit`, and `Write`.
+- Plugin disabled — only the test hook is active.
+
+Step-by-step observation:
+
+1. `Read(orig.txt)` — redirect fires; tool reads `redirect.txt`; Claude receives `"REDIRECTED_VIA_HOOK"`; `pre_Read` and `post_Read` hook stdin both produced; transcript records `Read(orig.txt)`. The session's `readFiles` now contains `redirect.txt` (not `orig.txt`).
+2. `Edit(orig.txt, ...)` — CC client-side check asks "is `orig.txt ∈ readFiles`?" Answer: No (only `redirect.txt` is in the set). CC fails fast with `File must be read first` and **never invokes `PreToolUse` for the Edit**. The redirect-on-Edit branch is unreachable. No `pre_Edit` log entry is produced. The same holds for `Write(orig.txt)` — fails fast with `Error writing file` / "File has not been read yet" before the Write hook can redirect.
+3. The model self-corrects by re-issuing `Read(orig.txt)`. The hook redirects again; `readFiles` still does not gain `orig.txt`. The loop is infinite from the model's perspective. The model eventually verifies via `Bash` (`Get-Content` / `cat`) and detects the inconsistency between Read content and physical content, concluding aloud that "the read was redirected by a hook."
+
+The hook author has no way to break this asymmetry from inside the hook: by the time `PreToolUse` for Edit/Write would run, the precondition has already failed and the hook is not invoked. Even adding more redirect entries to the same hook (matcher widened to all of `Read|Edit|Write`) does not help.
+
+**Why this matters architecturally**: any "don't touch the original on disk" plugin design — where Pre creates a UTF-8 sibling and Pre redirects all reads/writes to it — is **structurally infeasible** under the current CC validation order, regardless of how clever the hook is. This is the single empirical finding that conclusively rules out the "Solution 2" family for `claude_encoding_guard`.
+
+If CC were to (a) run `PreToolUse` before the precondition checks, or (b) populate `readFiles` with both pre- and post-redirect paths on a Read redirect, the asymmetry would close. An issue has been drafted upstream (TODO: link once filed).
+
+### Stale-detection baseline timing — empirical pinning
+
+The stale-detection baseline (the content snapshot that subsequent Edit/Write are compared against) is locked at the moment the Read tool **completes**, i.e., **before** the `PostToolUse(Read)` hook runs. Mutations performed inside `Post(Read)` do **not** enter the baseline; they show up as "drift" from the baseline that any later Edit/Write will fail-fast against.
+
+Two empirical confirmations:
+
+**Phase C (ASCII fixture, single Read + Write, "different mutation content"):**
+- fixture `baseline_test.txt = "PRE_PHYSICAL"`
+- Hook: `Pre(Read)` no-op; `Post(Read)` overwrites disk to `"POST_MODIFIED"`
+- prompt 1: Read — tool returns `"PRE_PHYSICAL"`, Post mutates disk to `"POST_MODIFIED"`
+- prompt 2: Write (without re-Read) — fails fast with "file has been modified externally"; no `pre_Write` hook entry. Confirms: baseline was `"PRE_PHYSICAL"` (the content tool Read saw, before Post ran), not `"POST_MODIFIED"` (the post-Post disk state).
+
+**Phase D (real GBK fixture, simulates Solution 1 / "Post(Read) restore"):**
+- fixture `baseline_test_gbk.txt` = `"你好世界_PRE_PHYSICAL_GBK_中文测试_价格行情数据_2026\n"` written as GBK (53 bytes)
+- Hook: `Pre(Read)` GBK → UTF-8 (53 → 67 bytes); `Post(Read)` UTF-8 → GBK (67 → 53 bytes) — i.e., a faithful simulation of Solution 1's "convert in Pre, restore in Post"
+- prompt 1: Read — pre_convert + post_restore both fire; Claude receives UTF-8 text correctly; disk ends as GBK
+- prompt 2: Edit "中文测试" → "测试改名" — model issues Edit, CC fail-fasts at stale-detection (baseline = UTF-8 at tool-Read completion; current = GBK after Post restore). Model self-recovers by re-Read; another round of pre_convert + post_restore; another Edit; another stale-detection failure; loop.
+
+The model's own diagnosis (transcribed verbatim from the Phase D `last_assistant_message`):
+
+> "文件在每次 Read 之后立即被外部进程修改，导致 Edit 总是被拒绝……继续重试是无效的——根本原因是文件状态在 Read 后立刻发生变化，而非我的操作问题。" — "The file is being modified by an external process immediately after each Read, so Edit is consistently rejected. Continuing to retry is futile — the root cause is that the file state changes right after Read, not anything wrong with my operation."
+
+The model arrived at this conclusion from purely observable signals (multiple Read+Edit attempts all failing the same way) without being told the hook's behavior. This is the strongest empirical confirmation: **Solution 1 ("Pre(Read) convert + Post(Read) restore") is dead in the real GBK scenario** — not just slow due to extra Read calls, but a hard infinite loop with no escape, because Pre and Post mutate the file in opposite directions and the baseline is locked between them.
+
+The implication for `claude_encoding_guard` is final:
+
+- **There is no way under current CC mechanics to produce a "perfect" encoding-guard plugin** — one that keeps the on-disk file in its original encoding at all times outside the brief tool execution window. Any hook that mutates the file outside of a tool-execution window either (i) trips stale-detection on subsequent Edit/Write (Solution 1's death mode), or (ii) reaches the disk only after Edit/Write has already failed the precondition (Solution 2's death mode).
+- The plugin's current architecture — Pre(Read) convert + Post(Edit) restore + Stop restore-all — is the **only** viable design under CC's current validation order, at the cost of a "turn-length exposure window" during which the on-disk content is UTF-8 and visible to external observers (IDE watchers, build daemons, and most painfully: in-turn `Bash` compile commands that pick up the UTF-8 file under a system codepage that expects the original encoding).
+- Closing the exposure window requires either an upstream CC change (running `PreToolUse` before precondition checks, or extending the baseline-update protocol to include `PostToolUse` hook mutations), or accepting the trade-off and documenting it as a known limitation.
+
+### Read-first invariant and stale-detection
+
+CC enforces "must have Read this file in the current session before Edit/Write-existing" as a hard rule at two layers:
+
+1. **Read precondition (membership test)**: a session-scoped set of `readFiles`. `Edit`/`Write`-existing checks membership; missing → fail-fast (no hook). The Write tool prompt says "or the call will fail" (v2.1.120+ confirmed). Membership is also granted by `sed -n` / `cat` via `Bash` (CHANGELOG: "Changed Edit to work on files viewed via Bash with sed -n or cat, without requiring a separate Read call first").
+
+2. **Stale-detection (content-hash baseline)**: at Read tool completion, CC records a content-level baseline (not just `mtime`). On the next `Edit`/`Write` of the same path, CC compares current content against the recorded baseline; if different → "file has been modified externally" error, model is told to re-Read. The CHANGELOG entry `Fixed false 'file modified' errors on Windows when cloud sync tools, antivirus scanners, or Git touch file timestamps without changing content` (v2.1.7) reverse-confirms the baseline is content-hash, not pure-`mtime`. Empirically: `touch` (mtime-only change) does not trigger; rewriting the file content does.
+
+Known violations of the Read-first invariant / corner cases where it does not protect us:
+
+- **Historical bugs (now fixed in CHANGELOG)**:
+  - Session resume losing `readFiles` set: "Fixed bug with resuming where previously created files needed to be read again before writing".
+  - `-p` mode `@`-mentioned files not counting as Read: "Fixed bug with `-p` mode where @-mentioned files needed to be read again before writing".
+- **`Bash` bypass (uncloseable from a hook plugin)**: any `Bash` invocation that writes a file (`sed -i`, redirections like `>`/`>>`, in-Bash editors, etc.) flows through the `Bash` tool, not `Edit`/`Write`. The encoding hook on `Read|Edit|Write` is not fired. This is the dominant remaining case where an encoding plugin cannot help.
+- **Explicit "don't re-Read" instructions to the model**: the model may go ahead and emit an `Edit` tool call without re-reading. CC's client-side validation fail-fasts at the `old_string` / stale-detection / Read-precondition layer; the file is unchanged, but the hook does not fire either. The user-visible failure is harmless to file integrity, but the plugin is blind to it.
+- **Subagents (Plan/Explore/Task)**: not yet empirically verified — see "Open empirical gaps".
+- **Across a `compact` boundary**: it is not yet verified whether `readFiles` membership persists across compact; if not, the first `Edit` post-compact would fail Read precondition until a re-Read.
+
+Implication for an encoding-conversion plugin: any conversion that changes the on-disk content **between a Read and the next Edit on the same path** will trip stale-detection and force the model into a re-Read loop. This is a hard constraint on hook lifecycle design, not just a performance trade-off.
 
 ### Failure-mode safety: how the original file is protected
 
-Two architecturally distinct ways a hook plugin can keep the original bytes safe when a tool call fails:
+**(a) In-place convert + reverse — current main + chardet7-preview architecture**: Pre converts the original file in place to UTF-8, Post converts back. If the tool fails without modifying content, the round-trip is byte-identical. Safety relies on a mathematical equivalence (`encode(decode(bytes)) == bytes`). Pre's `convert_file` aborts on `UnicodeDecodeError` so a wrong-encoding detection is caught before any write. The original file's `mtime` changes twice per Read/Edit cycle, which is visible to external watchers (IDEs, build daemons).
 
-**(a) In-place convert + reverse (current main + chardet7-preview architecture)**: Pre converts the original file in place to UTF-8, Post converts back. If the tool fails without modifying content, the round-trip is byte-identical. Safety relies on a mathematical equivalence (`encode(decode(bytes)) == bytes`). Pre's `convert_file` aborts on `UnicodeDecodeError` so a wrong-encoding detection is caught before any write. The original file's `mtime` changes twice per Read/Edit cycle, which is visible to external watchers (IDEs, build daemons).
+**(b) Redirect to temp + sync-back on success — evaluated and shelved**: The original design idea was to have `Pre(Read)` create a fresh UTF-8 sibling and `updatedInput`-redirect the path; the original would never be touched on disk. `Post(Edit)` would sync back to the original only on tool success; on failure, the temp would be discarded and the original would remain literally byte-identical with unchanged `mtime`. Safety would have been *structural* (Pre never writes the original) rather than mathematical. External watchers would have seen at most one `mtime` bump per successful Edit/Write — a much shorter and tighter exposure window than (a).
 
-**(b) Redirect to temp + sync-back on success (Solution 2 design, not yet implemented)**: Pre creates a fresh temp UTF-8 file and `updatedInput`s the path to it; the original is not touched. Post syncs back only on tool success; on failure, the temp is discarded and the original remains literally byte-identical with unchanged `mtime`. Safety is structural (Pre never writes the original) rather than mathematical. External watchers see at most one `mtime` bump per successful Edit/Write.
+This design was discovered to be **structurally infeasible** under current CC behavior — see "Client-side validation" and "Asymmetric `readFiles` tracking" above. Briefly: `Read(orig)` populates the `readFiles` tracker with the post-redirect path, but `Edit(orig)` / `Write(orig)` validates against the pre-redirect path. Because Edit/Write fail fast *before* `PreToolUse` is invoked, the hook cannot apply a symmetric redirect to rescue. This rules out the entire family of "don't touch the original on disk" hooks for any tool with a Read-precondition. The plugin therefore stays with architecture (a).
 
-A failed tool — `Edit` with non-matching `old_string`, `Write` with disk error, etc. — leaves the original file's content intact under either architecture. Architecture (b) additionally preserves the `mtime`/`inode`-level invariants and gives stronger safety when Post itself encounters an error (e.g., reverse-encode failure due to characters Claude introduced that aren't representable in the original encoding — currently a known limitation in (a)).
+Under (a), a failed tool — `Edit` with non-matching `old_string`, `Write` with disk error, etc. — still leaves the original file's content intact, because (1) failures of the `old_string`, stale-detection, and Read-precondition kinds short-circuit at CC's client-side validation layer (no `PostToolUse` fires, no Edit/Write reaches disk), and (2) any in-tool failure that does reach disk is caught by `convert_file`'s atomic-write guard. The remaining gap in (a) is the small "exposure window" — on-disk content is UTF-8 between `Pre(Read)` and `Stop`, observable to external file watchers / build processes that act inside that window.
 
 ### Open empirical gaps
 
 These have not been verified by experiment yet (deferred until needed):
 
-- `tool_response` schema for `Edit` / `Write` on success
-- `tool_response` schema for `Edit` / `Write` on failure (specifically, whether there is an explicit success/error field that hooks can branch on)
-- Pre/Post stdin `tool_input` shape for `Edit` (`old_string` / `new_string` field names) and `Write` (`content`)
-- Whether `PostToolUse` fires when the tool itself errors out (vs only on success)
-- Whether `Write` to a non-existent path triggers Pre with the path that doesn't exist yet (assumed yes)
+- Whether `PostToolUse` fires when the tool itself errors out **after** passing client-side validation (e.g., `Edit` hits a disk error mid-write). The "client-side fail-fast" path is closed (no `Post` fires); the in-tool error path is still open. No failed-`Edit`/`Write` `tool_response` has been observed because every observed failure was a validation fail-fast that bypassed the hook entirely.
+- `Pre`/`Post` behavior under subagents (Plan/Explore/Task) — whether hooks fire identically, attenuate, or are skipped for subagent-issued tool calls.
+- Whether `compact` (auto-compact or user-triggered) preserves the `readFiles` membership across the boundary — if not, the first `Edit` after compact would fail Read precondition until a re-Read.
+- Edit/Write `tool_response` shape for `replace_all: true` matching multiple sites — whether `structuredPatch` enumerates all hunks or merges them.
+- Suspected fail-fast on `Read` for large files invoked **without** `offset`/`limit`: in one observed run a `pre_Read` log entry was produced for a ~54 KB file with no matching `post_Read`, after which the model retried with explicit `offset`/`limit` and succeeded (both `pre`/`post` produced). This pattern resembles the other client-side fail-fasts but has not been isolated as a single-variable test.
+- **`PostToolUse.updatedToolOutput` interaction with subsequent client-side validations (v2.1.121+ feature, all tools)**: when a `PostToolUse(Read)` hook returns `updatedToolOutput` to replace `tool_response.file.content` (e.g. give Claude a UTF-8 decoded view of an on-disk GBK file), what content does CC use for the next `Edit`/`Write`'s client-side checks?
+  - (A) the on-disk bytes (Claude-visible content is decoupled from validations) → Edit's `old_string` check against UTF-8 string vs disk GBK bytes will fail-fast, locking out Edit just like the Solution 2 dead end
+  - (B) the post-hook Claude-visible content → Edit's `old_string` matches, and the entire "Read-path-without-disk-mutation" architecture becomes viable for an encoding-conversion plugin
+  - This is the single unknown gating whether `claude_encoding_guard`'s "no exposure window on Read path" redesign is possible. PoC plan in `_backup/reviews/phase_e_poc_plan.md`. Related: CC Read tool's behavior when reading non-UTF-8 bytes (does the tool fail, return mojibake with U+FFFD, or pass bytes through?) — `PostToolUse` cannot rescue a `Read` that errors out before producing a normal `tool_response`.
+- Whether `Read` actually invokes `PostToolUse` when the file content is not valid UTF-8 — required prerequisite for the above. If `Read` short-circuits (similar to Edit/Write fail-fast), `updatedToolOutput` for encoding rescue is structurally impossible.
