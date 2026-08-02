@@ -134,9 +134,48 @@ Pre hook validates cache on every access:
 
 ### Cleanup
 
-- Session directories older than 24 hours are removed on each Pre hook invocation
+- Only **empty** session directories older than 24 hours are removed on each Pre hook invocation — record-bearing directories are never auto-deleted (see Crash Recovery Architecture below)
 - Current session is always skipped during cleanup (compared by sanitized session_id)
 - Empty session directories are removed after the last cache file is deleted
+
+## Crash Recovery Architecture
+
+If the CC process dies mid-session (crash, kill, terminal closed), converted files stay UTF-8 on disk and their cache records become orphans. The recovery design rests on one ownership principle and splits into four layers.
+
+### Ownership principle: records are keyed by session, and hooks never cross that line
+
+A cache record is the only copy of the fact "this file on disk should be re-encoded back". Two automatic policies for *another* session's stale records were considered and rejected:
+
+- **Auto-delete after 24h** (the original behavior): irreversible information loss — after deletion not even a manual recovery is possible.
+- **Restore-before-delete**: falsified during design review. Its guard conditions ("file is valid UTF-8" + "re-encodes cleanly") are *also* satisfied when the user has deliberately accepted the UTF-8 state (converted the project, changed build flags). An automatic restore would silently override that intent.
+
+Since neither automatic action is safe on stale cross-session state, the rule is: **hooks operate strictly on their own session's records; acting on another session's records is reserved for the user** via the explicit recovery commands. (Removing *empty* foreign dirs stays in the Pre-hook janitor — an empty dir carries no user data.)
+
+### Four defense layers
+
+| Layer | Trigger | Covers |
+|---|---|---|
+| `Stop` → restore-all | every completed turn | files read but not edited this turn (original PR #2 semantic) |
+| `SessionEnd` → restore-all | session termination | turns interrupted with Esc (Stop does not fire on user interrupts — docs-confirmed) |
+| `SessionStart(resume)` → restore-all | resuming a session | crash residue, healed **before** the resumed session acts |
+| `scan` / `restore-current` / `prune-current` | user-invoked CLI | orphans from crashed sessions that are never resumed |
+
+Why SessionStart matters even though the first turn's Stop would eventually heal: during that first turn the disk is still UTF-8, and the user's first instruction after a crash may be `git commit` — which would permanently record converted files. Healing at session start closes that window. At SessionStart no turn is in flight, so any record present is by definition residue; restoring immediately has no ambiguity.
+
+**SessionStart matcher must be exactly `resume`.** Never `compact`: auto-compact can fire in the middle of a long turn, and a restore-all at that point converts files back to their original encoding while Claude still holds the UTF-8 view mid-turn — recreating the stale-baseline death spiral documented in "Stale-detection baseline timing" above. (`startup`/`clear` sessions have a fresh session_id and an empty cache dir, so registering them would be a no-op.)
+
+Resume keeps the session ID on all three paths — CLI `--resume`, CLI `--continue` (documented), and the TUI `/resume` picker (verified empirically 2026-08-02: hook logs show identical session_id and transcript across an exit/resume boundary). That is what makes the SessionStart layer reach crash residue at all.
+
+### Recovery commands
+
+`scan` / `scan-current` are read-only reports over `CACHE_ROOT/*/​*.json` (discovery is record-driven — user project files are never crawled). Each record is classified by on-disk facts only:
+
+- **moot** — provably worthless: unreadable/invalid record, target file missing, or target no longer valid UTF-8 (already restored or rewritten). Safe to prune.
+- **actionable** — target exists and is valid UTF-8: restore is possible. Deliberately no encode-back test at scan time; a content drift that no longer fits the original encoding is discovered and reported by `restore-current` itself (`convert_file` fails gracefully and keeps the record).
+
+`restore-current` / `prune-current` act only on records whose target lies under the cwd — there is intentionally **no global restore**: batch-restoring across projects is a decision no user can responsibly make in one keypress. Guards on both: the running session's own dir is excluded via `CLAUDE_CODE_SESSION_ID`, and records written within the last hour are skipped unless `--all` (a live parallel session's in-flight records look identical to orphans; the user is the only reliable liveness oracle). The liveness heuristic is judged per record file, not per session dir — restore/prune unlink sibling records and would bump the dir mtime, locking the user out of their own follow-up command. `prune-current` deletes moot records; actionable ones only with `--discard` (user accepts the UTF-8 state).
+
+The `/encoding-guard:scan` slash command wraps this flow: inline `!`-preprocessing runs `scan-current --json` deterministically, then the command guides an AskUserQuestion (restore all / discard / pick per file / not now). Scan output is treated as untrusted data in that flow — only whitelisted-encoding names and normalized paths reach the option labels.
 
 ## Why Read-Time Conversion?
 

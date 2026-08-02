@@ -61,7 +61,7 @@ A migration to chardet 7.x is being prototyped on the [`chardet7-preview`](https
 - **chardet 5.x**: Version 7.x reduced CJK detection confidence from 0.99 to 0.40 — below the safety threshold. Pinned via PEP 723 in an isolated environment.
 - **Binary detection**: chardet misidentifies some binary files as Windows-1252 (confidence 0.73). [binaryornot](https://github.com/binaryornot/binaryornot) filters these out. Always on, not configurable.
 - **Encoding aliases**: GB2312 → GBK (byte-compatible superset), ISO-8859-1 → Windows-1252 (industry practice).
-- **Session-isolated cache**: `<tmpdir>/.cc_encoding_cache/<session_id>/` — no cross-session interference. Stale sessions (>24h) auto-cleaned.
+- **Session-isolated cache**: `<tmpdir>/.cc_encoding_cache/<session_id>/` — no cross-session interference. Hooks act strictly on their own session's records; stale **empty** session dirs (>24h) are auto-removed, record-bearing dirs never are (see Crash Recovery).
 
 ## Known Limitations
 
@@ -73,7 +73,29 @@ A migration to chardet 7.x is being prototyped on the [`chardet7-preview`](https
 
 - **Claude Code assumes absolute paths.** This plugin relies on Claude Code providing absolute file paths in hook stdin JSON, which is the observed behavior. Symbolic links or junctions pointing to the same file may produce different cache keys.
 
-- **Concurrent Claude Code instances on the same file.** If two CC instances edit or read the same file at the same time, one session's Stop restore can overwrite another session's pending Edit. Session-isolated caches prevent most cross-contamination, but a race window remains. Concurrent use is rare enough that this trade-off is accepted in exchange for Read-without-Edit recovery.
+- **Concurrent Claude Code instances on the same file.** If two CC instances edit or read the same file at the same time, one session's Stop restore can overwrite another session's pending Edit. Session-isolated caches prevent most cross-contamination, but a race window remains. Concurrent use is rare enough that this trade-off is accepted in exchange for Read-without-Edit recovery. The recovery commands additionally skip records written within the last hour unless `--all` is passed.
+
+## Crash Recovery
+
+If Claude Code is killed mid-session (crash, terminal closed), files can be left in their temporary UTF-8 state. Four layers deal with this:
+
+| Layer | When | What it does |
+|---|---|---|
+| `Stop` restore-all | end of every turn | restores files read but never edited this turn |
+| `SessionEnd` restore-all | session exits | backstop — also covers turns interrupted with Esc |
+| `SessionStart(resume)` restore-all | resuming a session | heals crash residue before anything else runs in the resumed session |
+| `/encoding-guard:scan` | you run it | finds records left by crashed sessions you never resumed |
+
+The first three are automatic — resuming a crashed session (CLI `--resume` / `-c` or the TUI `/resume` picker all keep the session ID) is enough to self-heal. The only case needing you: a crashed session you never resume. Run `/encoding-guard:scan` inside Claude Code (interactive: restore all / discard / pick per file), or from a terminal in the affected project directory:
+
+```bash
+uv run --script <plugin>/hooks/encoding_guard.py scan             # read-only report, all sessions
+uv run --script <plugin>/hooks/encoding_guard.py scan-current     # read-only report, current directory
+uv run --script <plugin>/hooks/encoding_guard.py restore-current  # restore files under current directory
+uv run --script <plugin>/hooks/encoding_guard.py prune-current    # delete defunct records (--discard: restorable ones too)
+```
+
+Safety rules baked in: the recovery commands never touch the running session's records (via `CLAUDE_CODE_SESSION_ID`), skip records written within the last hour unless `--all` is passed (a fresh record likely belongs to a live session), and only auto-delete records that are provably worthless (target file gone, or no longer UTF-8 — meaning it was already restored or rewritten). Hooks never delete another session's records: a record is the only copy of "this file should be converted back", so acting on other sessions' records is reserved for you.
 
 ## Advanced Configuration
 

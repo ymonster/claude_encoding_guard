@@ -61,7 +61,7 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 - **chardet 5.x**：7.x 对 CJK 检测置信度从 0.99 降到 0.40——低于安全阈值。通过 PEP 723 锁定在隔离环境中。
 - **二进制检测**：chardet 将某些二进制误判为 Windows-1252（0.73 置信度）。[binaryornot](https://github.com/binaryornot/binaryornot) 过滤。始终开启，不可关闭。
 - **编码别名**：GB2312 → GBK（字节兼容超集），ISO-8859-1 → Windows-1252（行业惯例）。
-- **会话隔离缓存**：`<tmpdir>/.cc_encoding_cache/<session_id>/`——不跨会话干扰。24 小时自动清理残留。
+- **会话隔离缓存**：`<tmpdir>/.cc_encoding_cache/<session_id>/`——不跨会话干扰。Hook 严格只操作自己会话的记录；超过 24 小时的**空**会话目录自动清除，含记录的目录永不自动删除（见"崩溃恢复"）。
 
 ## 已知限制
 
@@ -73,7 +73,29 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 
 - **依赖绝对路径。** 本插件依赖 Claude Code 在 hook stdin JSON 中提供绝对路径（已验证的实际行为）。符号链接或 junction 指向同一文件可能产生不同的缓存键。
 
-- **多个 Claude Code 实例同时操作同一文件。** 两个 CC 实例并发编辑/读取同一文件时，一个会话 Stop 触发的恢复可能覆盖另一会话尚未完成的 Edit。会话隔离缓存阻止了大部分交叉污染，但仍有一个极窄的竞态窗口。并发使用极少见，这个 trade-off 被接受以换取 Read-without-Edit 的恢复能力。
+- **多个 Claude Code 实例同时操作同一文件。** 两个 CC 实例并发编辑/读取同一文件时，一个会话 Stop 触发的恢复可能覆盖另一会话尚未完成的 Edit。会话隔离缓存阻止了大部分交叉污染，但仍有一个极窄的竞态窗口。并发使用极少见，这个 trade-off 被接受以换取 Read-without-Edit 的恢复能力。恢复命令族额外会跳过最近一小时内写入的记录（`--all` 可覆盖）。
+
+## 崩溃恢复
+
+Claude Code 中途被杀（崩溃、终端被关）时，文件可能停留在临时的 UTF-8 状态。四层防线：
+
+| 层 | 时机 | 作用 |
+|---|---|---|
+| `Stop` restore-all | 每轮对话结束 | 恢复本轮读过但没编辑的文件 |
+| `SessionEnd` restore-all | 会话退出 | 兜底——含被 Esc 打断的轮次 |
+| `SessionStart(resume)` restore-all | resume 会话时 | 在 resume 后任何动作之前清理崩溃残留 |
+| `/encoding-guard:scan` | 你手动运行 | 找出你再也没 resume 的崩溃会话留下的记录 |
+
+前三层全自动——resume 崩溃的会话（CLI `--resume` / `-c` 或 TUI 的 `/resume` 选单都保持 session ID）即可自愈。唯一需要你出手的场景：崩溃后再也没 resume 的会话。在 Claude Code 里运行 `/encoding-guard:scan`（交互式：全部恢复 / 放弃记录 / 逐个选择），或在受影响的项目目录下用终端：
+
+```bash
+uv run --script <plugin>/hooks/encoding_guard.py scan             # 只读报告，全部会话
+uv run --script <plugin>/hooks/encoding_guard.py scan-current     # 只读报告，当前目录
+uv run --script <plugin>/hooks/encoding_guard.py restore-current  # 恢复当前目录下的文件
+uv run --script <plugin>/hooks/encoding_guard.py prune-current    # 删除作废记录（--discard 连可恢复的一起删）
+```
+
+内置安全规则：恢复命令永不碰正在运行会话的记录（通过 `CLAUDE_CODE_SESSION_ID` 识别）、默认跳过最近一小时内写入的记录（新鲜记录大概率属于活跃会话，`--all` 覆盖）、只自动删除可 100% 证明作废的记录（目标文件已不存在，或已不是 UTF-8——说明早已恢复或被重写）。Hook 永不删除其它会话的记录：记录是"这个文件本该转回原编码"这条信息的唯一载体，处置别的会话的记录只属于你。
 
 ## 高级配置
 
