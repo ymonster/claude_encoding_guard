@@ -10,24 +10,38 @@ Strategy:
     1. PreToolUse (Read):  detect encoding + line endings, convert to UTF-8 so Claude reads correctly
     2. PreToolUse (Edit):  file already UTF-8 (cache exists), skip
     3. PostToolUse (Edit): restore original encoding + line endings from session cache
-    4. Stop (restore-all): restore any remaining files that were read but never edited
+    4. Stop / SessionEnd / SessionStart(resume) (restore-all):
+       restore any remaining files — turn cleanup, exit backstop, and
+       crash-residue healing before the resumed session acts
+
+Recovery commands (user-invoked CLI, not hooks):
+    scan / scan-current           read-only report of cache records
+    restore-current               restore orphaned files under the cwd
+    prune-current                 delete defunct records under the cwd
 
 Cache layout:
     <tempdir>/.cc_encoding_cache/<session_id>/<sha256(normalized_path)[:16]>.json
 
-Each session gets its own cache directory. Stale sessions (>24h) are cleaned up on startup.
+Each session gets its own cache directory. Hooks operate strictly on their
+own session's records; only the user-invoked recovery commands may act on
+other sessions' records. Stale EMPTY session dirs (>24h) are removed on
+startup — record-bearing dirs are never auto-deleted.
 Stdin is read as binary (sys.stdin.buffer) to avoid Windows codepage issues.
 """
 
-# Read stdin immediately before any heavy imports (Windows stdin reliability)
+# Read stdin immediately before any heavy imports (Windows stdin reliability).
+# Hook modes only: CC feeds hooks a pipe that closes. In the recovery CLI
+# modes stdin may be an interactive terminal, where a blind read() would
+# block forever.
 import sys
-_raw_stdin = sys.stdin.buffer.read()
+_raw_stdin = b""
+if len(sys.argv) > 1 and sys.argv[1] in ("pre", "post", "restore-all"):
+    _raw_stdin = sys.stdin.buffer.read()
 
 import contextlib
 import json
 import os
 import hashlib
-import shutil
 import tempfile
 import time
 
@@ -111,7 +125,14 @@ def cache_path(session_id: str, path: str) -> str:
 
 
 def cleanup_stale_sessions(current_session_id: str):
-    """Remove session cache directories older than STALE_HOURS, skipping current session."""
+    """Remove EMPTY stale session dirs only. Never touches another session's records.
+
+    An orphaned record is the only copy of "this file on disk should be
+    re-encoded back" — deleting it is irreversible information loss, and
+    restoring it automatically can override a user who has since accepted
+    the UTF-8 state. Cross-session records are therefore acted on only by
+    the user, via the scan/restore-current/prune-current commands.
+    """
     if not os.path.exists(CACHE_ROOT):
         return
     current_dir_name = sanitize_session_id(current_session_id)
@@ -123,8 +144,9 @@ def cleanup_stale_sessions(current_session_id: str):
             sid_dir = os.path.join(CACHE_ROOT, name)
             if os.path.isdir(sid_dir):
                 age = now - os.path.getmtime(sid_dir)
-                if age > STALE_HOURS * 3600:
-                    shutil.rmtree(sid_dir, ignore_errors=True)
+                if age > STALE_HOURS * 3600 and not os.listdir(sid_dir):
+                    with contextlib.suppress(OSError):
+                        os.rmdir(sid_dir)
     except OSError:
         pass
 
@@ -409,12 +431,316 @@ def handle_restore_all(hook_json: dict | None):
             os.rmdir(sd)
 
 
+# ---------------------------------------------------------------------------
+# Recovery commands: scan / scan-current / restore-current / prune-current
+#
+# User-invoked CLI modes, not hooks. These are the only code paths allowed
+# to look at OTHER sessions' cache records; hooks operate strictly on their
+# own session_id. Discovery is record-driven: only CACHE_ROOT/*/​*.json is
+# read — user project files are never crawled.
+# ---------------------------------------------------------------------------
+
+RECENT_SECONDS = 3600  # session dirs younger than this may belong to a live session
+
+
+def classify_record(record_file: str) -> tuple[str, dict | None, str]:
+    """Classify one cache record by on-disk facts.
+
+    "moot"       — provably worthless: unreadable/invalid record, target
+                   file missing, or file no longer valid UTF-8 (already
+                   restored, reverted, or rewritten). Safe to delete.
+    "actionable" — target file exists and is valid UTF-8: a restore is
+                   possible. No encode-back test here — a failing
+                   re-encode is discovered and reported by restore
+                   itself (convert_file keeps the record on failure).
+    """
+    try:
+        with open(record_file, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return ("moot", None, f"unreadable record: {e}")
+    if (not isinstance(data, dict)
+            or not isinstance(data.get("path"), str)
+            or not data["path"]
+            or not isinstance(data.get("encoding"), str)
+            or data.get("line_ending") not in ("lf", "crlf")
+            or _strip_enc(data["encoding"]) not in _RESTORE_SET):
+        return ("moot", data if isinstance(data, dict) else None, "invalid record fields")
+    path = data["path"]
+    if not os.path.isfile(path):
+        return ("moot", data, "target file no longer exists")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        # Cannot prove anything about a file we cannot read — keep the record.
+        return ("actionable", data, f"file unreadable right now ({e}); record kept")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("moot", data, "file is no longer UTF-8 (already restored or rewritten)")
+    return ("actionable", data, "file is UTF-8; original encoding on record")
+
+
+def _own_session_dir_name() -> str | None:
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    return sanitize_session_id(sid) if sid else None
+
+
+def _path_under(child: str, parent: str) -> bool:
+    child_n = normalize_path(os.path.abspath(child))
+    parent_n = normalize_path(os.path.abspath(parent))
+    return child_n == parent_n or child_n.startswith(parent_n + os.sep)
+
+
+def collect_records(scope_cwd: str | None) -> list[dict]:
+    """Classify every record under CACHE_ROOT.
+
+    scope_cwd filters to records whose target path lies under that
+    directory. Records without a readable path can never match a scope
+    filter — they surface only in the global scan.
+    """
+    rows = []
+    if not os.path.isdir(CACHE_ROOT):
+        return rows
+    now = time.time()
+    for name in sorted(os.listdir(CACHE_ROOT)):
+        sid_dir = os.path.join(CACHE_ROOT, name)
+        if not os.path.isdir(sid_dir):
+            continue
+        try:
+            age_s = int(now - os.path.getmtime(sid_dir))
+        except OSError:
+            age_s = None
+        try:
+            entries = sorted(os.listdir(sid_dir))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".json"):
+                continue
+            record_file = os.path.join(sid_dir, entry)
+            category, record, detail = classify_record(record_file)
+            path = record.get("path") if isinstance(record, dict) else None
+            if scope_cwd is not None:
+                if not (isinstance(path, str) and path and _path_under(path, scope_cwd)):
+                    continue
+            try:
+                record_age_s = int(now - os.path.getmtime(record_file))
+            except OSError:
+                record_age_s = None
+            rows.append({
+                "session": name,
+                "session_age_seconds": age_s,
+                "record_age_seconds": record_age_s,
+                "record_file": record_file,
+                "category": category,
+                "path": path if isinstance(path, str) else None,
+                "encoding": record.get("encoding") if isinstance(record, dict) else None,
+                "line_ending": record.get("line_ending") if isinstance(record, dict) else None,
+                "detail": detail,
+            })
+    return rows
+
+
+def _guard_reason(row: dict, include_all: bool) -> str | None:
+    """Why this record must not be modified right now, or None.
+
+    Liveness is judged per RECORD (its file mtime), not per session dir:
+    a live session's in-flight record was written seconds ago, while an
+    orphan record is old by definition. Directory mtime would self-lock —
+    our own restore/prune bump the dir mtime by unlinking siblings.
+    """
+    own = _own_session_dir_name()
+    if own is not None and row["session"] == own:
+        return "own live session (CLAUDE_CODE_SESSION_ID)"
+    age_s = row["record_age_seconds"]
+    if not include_all and age_s is not None and age_s < RECENT_SECONDS:
+        return (f"record written {age_s // 60}m ago — possibly a live "
+                f"session; pass --all to override")
+    return None
+
+
+def _age_str(age_s) -> str:
+    if age_s is None:
+        return "age unknown"
+    if age_s < 3600:
+        return f"{age_s // 60}m ago"
+    if age_s < 86400:
+        return f"{age_s // 3600}h ago"
+    return f"{age_s // 86400}d ago"
+
+
+def _cleanup_empty_dirs(sessions: set[str]) -> None:
+    for name in sessions:
+        sid_dir = os.path.join(CACHE_ROOT, name)
+        with contextlib.suppress(OSError):
+            if os.path.isdir(sid_dir) and not os.listdir(sid_dir):
+                os.rmdir(sid_dir)
+
+
+def handle_scan(scope_cwd: str | None, as_json: bool) -> int:
+    """Read-only report. Never modifies records or files."""
+    rows = collect_records(scope_cwd)
+    actionable = [r for r in rows if r["category"] == "actionable"]
+    moot = [r for r in rows if r["category"] == "moot"]
+    if as_json:
+        print(json.dumps({
+            "cache_root": CACHE_ROOT,
+            "scope": scope_cwd,
+            "own_session": _own_session_dir_name(),
+            "summary": {"actionable": len(actionable), "moot": len(moot)},
+            "records": rows,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    where = f" for files under {scope_cwd}" if scope_cwd else " (all sessions)"
+    if not rows:
+        print(f"encoding-guard: no cache records found{where}. Clean.")
+        return 0
+    print(f"encoding-guard: {len(actionable)} restorable, {len(moot)} defunct record(s){where}\n")
+    by_session: dict[str, list[dict]] = {}
+    for r in rows:
+        by_session.setdefault(r["session"], []).append(r)
+    own = _own_session_dir_name()
+    for name, group in by_session.items():
+        tags = [_age_str(group[0]["session_age_seconds"])]
+        fresh_records = [r for r in group
+                         if r["record_age_seconds"] is not None
+                         and r["record_age_seconds"] < RECENT_SECONDS]
+        if own is not None and name == own:
+            tags.append("THIS session")
+        elif fresh_records:
+            tags.append("possibly live")
+        print(f"session {name} ({', '.join(tags)}):")
+        for r in group:
+            mark = "RESTORABLE" if r["category"] == "actionable" else "defunct"
+            target = r["path"] or r["record_file"]
+            enc = f" [{r['encoding']}]" if r["encoding"] else ""
+            print(f"  {mark:>10}  {target}{enc} — {r['detail']}")
+        print()
+    if scope_cwd is not None:
+        if actionable:
+            print("To restore these files to their original encoding, run this "
+                  "command again with mode 'restore-current'.")
+        if moot:
+            print("To remove defunct records, run mode 'prune-current'.")
+    else:
+        print("Note: restore/prune operate per-project — cd into the project "
+              "and use restore-current / prune-current.")
+    return 0
+
+
+def _match_paths_filter(row: dict, paths_filter: list[str] | None) -> bool:
+    if not paths_filter:
+        return True
+    if not row["path"]:
+        return False
+    target = normalize_path(os.path.abspath(row["path"]))
+    return any(normalize_path(os.path.abspath(p)) == target for p in paths_filter)
+
+
+def handle_restore_current(paths_filter: list[str] | None, include_all: bool) -> int:
+    """Restore actionable records whose target lies under the current directory."""
+    cwd = os.getcwd()
+    rows = collect_records(cwd)
+    restored = failed = skipped = 0
+    touched_sessions: set[str] = set()
+    for row in rows:
+        if row["category"] != "actionable" or not _match_paths_filter(row, paths_filter):
+            continue
+        reason = _guard_reason(row, include_all)
+        if reason is not None:
+            print(f"SKIP     {row['path']} — {reason}")
+            skipped += 1
+            continue
+        enc = row["encoding"]
+        eol = row["line_ending"] or "lf"
+        if convert_file(row["path"], "utf-8", enc, target_eol=eol):
+            with contextlib.suppress(OSError):
+                os.unlink(row["record_file"])
+            touched_sessions.add(row["session"])
+            print(f"RESTORED {row['path']} utf-8→{enc} eol={eol}")
+            restored += 1
+        else:
+            print(f"FAILED   {row['path']} — could not re-encode to {enc}; "
+                  f"record kept (file may have been edited as UTF-8)")
+            failed += 1
+    _cleanup_empty_dirs(touched_sessions)
+    print(f"\nrestore-current: {restored} restored, {failed} failed, {skipped} skipped")
+    return 0 if failed == 0 else 1
+
+
+def handle_prune_current(paths_filter: list[str] | None, include_all: bool,
+                         discard_actionable: bool) -> int:
+    """Delete defunct records under the current directory.
+
+    Actionable records are deleted only with --discard (the user accepts
+    the current UTF-8 state and wants the reminder gone).
+    """
+    cwd = os.getcwd()
+    rows = collect_records(cwd)
+    pruned = skipped = 0
+    touched_sessions: set[str] = set()
+    for row in rows:
+        if not _match_paths_filter(row, paths_filter):
+            continue
+        if row["category"] == "actionable" and not discard_actionable:
+            continue
+        reason = _guard_reason(row, include_all)
+        if reason is not None:
+            print(f"SKIP   {row['path'] or row['record_file']} — {reason}")
+            skipped += 1
+            continue
+        with contextlib.suppress(OSError):
+            os.unlink(row["record_file"])
+        touched_sessions.add(row["session"])
+        label = "discarded" if row["category"] == "actionable" else "pruned"
+        print(f"{label.upper():>9}  {row['path'] or row['record_file']} — {row['detail']}")
+        pruned += 1
+    _cleanup_empty_dirs(touched_sessions)
+    print(f"\nprune-current: {pruned} removed, {skipped} skipped")
+    return 0
+
+
+def run_recovery_cli(mode: str, argv: list[str]) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog=f"encoding_guard.py {mode}")
+    if mode in ("scan", "scan-current"):
+        ap.add_argument("--json", action="store_true",
+                        help="machine-readable output")
+    else:
+        ap.add_argument("--path", action="append", default=[],
+                        help="only this file (repeatable)")
+        ap.add_argument("--all", action="store_true",
+                        help="include recently-active session dirs")
+        if mode == "prune-current":
+            ap.add_argument("--discard", action="store_true",
+                            help="also delete restorable records (accept current UTF-8 state)")
+    args = ap.parse_args(argv)
+    if mode == "scan":
+        return handle_scan(None, args.json)
+    if mode == "scan-current":
+        return handle_scan(os.getcwd(), args.json)
+    if mode == "restore-current":
+        return handle_restore_current(args.path or None, args.all)
+    return handle_prune_current(args.path or None, args.all, args.discard)
+
+
+HOOK_MODES = ("pre", "post", "restore-all")
+RECOVERY_MODES = ("scan", "scan-current", "restore-current", "prune-current")
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("pre", "post", "restore-all"):
-        _log("Usage: encoding_guard.py <pre|post|restore-all>")
+    if len(sys.argv) < 2 or sys.argv[1] not in HOOK_MODES + RECOVERY_MODES:
+        _log("Usage: encoding_guard.py "
+             "<pre|post|restore-all|scan|scan-current|restore-current|prune-current>")
         sys.exit(0)  # never block Claude Code
 
     mode = sys.argv[1]
+
+    if mode in RECOVERY_MODES:
+        # User-invoked CLI, not a hook: normal exit codes, output on stdout.
+        sys.exit(run_recovery_cli(mode, sys.argv[2:]))
 
     hook_json = None
     try:
