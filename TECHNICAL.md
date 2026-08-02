@@ -42,6 +42,9 @@ chardet 7.x is a complete rewrite (Mar 2026) with a cosine-similarity bigram-mod
 | EUC-JP | 0.99 | 0.83–0.91 |
 | Shift_JIS | 0.99 | 0.83 (returned as `cp932`, not `SHIFT_JIS`) |
 | EUC-KR | 0.99 | 0.85 (returned as `CP949`, not `EUC-KR`) |
+| Windows-1250 (Polish) | **misdetected as `Windows-1252` at 0.58–0.65** | 0.26–0.32 (correct `cp1250`) |
+
+The Windows-1250 row is not just a number shift — 5.x misattributes cp1250 text to Windows-1252 **above `main`'s 0.5 confidence gate**, so the 5.x-based plugin on `main` actively converts cp1250 files with the wrong codec today (byte round-trip survives, but Claude sees `ś` as `œ`; edits then propagate the garbled semantics). Found during [PR #4](https://github.com/ymonster/claude_encoding_guard/pull/4) review; one more data point for the 7.x migration.
 
 Other behavioral changes in 7.x that block a drop-in upgrade:
 - **Built-in binary detection** at pipeline stage 5 returns `encoding=None` for binaries (could replace binaryornot)
@@ -92,7 +95,7 @@ The aliased path (gb2312 → gbk, iso-8859-1 → windows-1252) was unaffected be
 
 ## chardet 7.x Migration Findings
 
-This branch (`chardet7-preview`) was prototyped to evaluate replacing chardet 5.x + binaryornot with chardet 7.x's built-in pipeline. The harness (`_backup/pr_test_harness.py`) reports 73/73 fixtures PASS — same as `main`'s 5.x baseline. What follows is the empirical rationale for the design choices that got there.
+This branch (`chardet7-preview`) was prototyped to evaluate replacing chardet 5.x + binaryornot with chardet 7.x's built-in pipeline. The harness (`_backup/pr_test_harness.py`) reports 88/89 fixtures PASS (73 original + 16 Central European added during PR #4 review; the one "failure" is a 50-byte cp1250 fixture conservatively skipped below the 0.10 noise floor — the safe direction). What follows is the empirical rationale for the design choices that got there.
 
 ### Detection Strategy (`detect_safely`)
 
@@ -100,8 +103,8 @@ This branch (`chardet7-preview`) was prototyped to evaluate replacing chardet 5.
 # 1. Empty input → utf-8 (handled before this function)
 # 2. Pure-ASCII short-circuit (all bytes < 0x80) → skip
 # 3. chardet.detect(data,
-#                   encoding_era=EncodingEra.MODERN_WEB,
-#                   prefer_superset=True)
+#                   encoding_era=EncodingEra.MODERN_WEB | EncodingEra.LEGACY_ISO,
+#                   prefer_superset=False)
 # 4. encoding == None         → binary, skip (stage 5 cut)
 # 5. encoding == "utf-8"      → already converted, skip
 # 6. _strip_enc not in RESTORE→ unsupported encoding, skip
@@ -136,13 +139,23 @@ chardet 7.x's pipeline stage 5 returns `encoding=None` for non-text input at con
 
 No false positives. binaryornot's known false positives on `_backup/cp1251_test/test.c` (115B mixed CP1251 source) and short Shift_JIS/EUC-JP files do not occur with chardet 7.x.
 
-### Why `EncodingEra.MODERN_WEB`?
+### Why `MODERN_WEB | LEGACY_ISO`? (changed from plain `MODERN_WEB` after PR #4)
 
-chardet 7.x ships 99 encoding probers spread across MODERN_WEB / LEGACY_ISO / LEGACY_MAC / LEGACY_REGIONAL / DOS / MAINFRAME eras. Restricting to MODERN_WEB shrinks the candidate space to web-relevant encodings (UTF-*, Windows-125x, CP874, KOI8-*, CJK multibyte) without losing anything we support.
+chardet 7.x ships 99 encoding probers spread across MODERN_WEB / LEGACY_ISO / LEGACY_MAC / LEGACY_REGIONAL / DOS / MAINFRAME eras (`EncodingEra` is an `IntFlag` — eras compose with `|`). The **entire ISO-8859-* family (-1 through -16) is classified under LEGACY_ISO**, so a plain-MODERN_WEB candidate set contains no ISO-8859 prober at all.
 
-### Why `prefer_superset=True`?
+That was harmless until [PR #4](https://github.com/ymonster/claude_encoding_guard/pull/4) added `cp1250` to RESTORE_ENCODINGS, which armed a **sibling-encoding trap**: a genuine ISO-8859-2 file, with its correct answer absent from the candidate set, top-detects as its near-twin `cp1250` at 0.12–0.30 confidence — above the 0.10 noise floor — and gets converted with the wrong codec. ISO-8859-2 and cp1250 differ at 47 byte positions (`ą`, `ś`, `ź` live at different code points), so ~5% of characters garble; the byte round-trip survives read-only use, but any Claude edit writes cp1250-semantics bytes into an ISO-8859-2 file. Empirically: all ISO-8859-2 Polish fixtures ≥100B misconverted (harness 81/89).
 
-For superset/subset sibling pairs, raw 7.x can return both at identical confidence (e.g., on a 49-byte EUC-KR fixture: `[CP949(0.58), EUC-KR(0.58)]`). With `prefer_superset=True` the subset is collapsed onto its superset, eliminating tied gaps that would break a gap-based heuristic. We don't use a gap heuristic any more, but the collapse also gives us cleaner Python codec semantics: `cp949` is a strict superset of `euc-kr`, so its codec round-trip is more permissive.
+The Cyrillic pair never triggered this because the ISO-8859-5 / windows-1251 layouts are radically different — windows-1251's bigram score for ISO-8859-5 text stays below the floor. The CE pair is dangerous precisely because the layouts are ~80% identical.
+
+Including LEGACY_ISO lets ISO-8859-* compete under their own names; they are not in RESTORE_ENCODINGS, so the existing allowlist filter skips them with no extra logic (`skip: top 'iso8859-2' (0.31) not in RESTORE_ENCODINGS`). Harness: 88/89.
+
+**Residual trade-off**: true cp1250 beats iso8859-2 by only ~0.02 confidence on our Polish corpus, so some Czech/Hungarian texts may flip the ranking and get a genuine cp1250 file skipped. That failure direction is "unprotected", not "corrupted" — acceptable for this plugin.
+
+### Why `prefer_superset=False`? (changed from `True` after PR #4)
+
+`prefer_superset=True` was originally enabled to collapse superset/subset ties (a 49-byte EUC-KR fixture returns `[CP949(0.58), EUC-KR(0.58)]`; the collapse picks the more permissive `cp949` codec). But it also performs WHATWG-style era folding: with LEGACY_ISO in the candidate set, an `iso8859-2` detection is **reported as `cp1250`**, and `iso8859-5` as `Windows-1251`. That folding is lossless for iso8859-1 → cp1252 (true superset) but **lossy for -2 and -5** (different layouts) — it silently reintroduces the misconversion the era widening was meant to fix, and extends it to Cyrillic (harness drops to 73/89, worse than before the fix).
+
+With `prefer_superset=False`, ISO encodings win under their own names and fall out at the allowlist. The original tie concern is moot: we no longer use a gap heuristic, and both `CP949` and `EUC-KR` are in RESTORE_ENCODINGS, so whichever name wins converts correctly (all Korean fixtures pass).
 
 ### Why an explicit ASCII short-circuit?
 

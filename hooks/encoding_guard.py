@@ -56,7 +56,7 @@ RESTORE_ENCODINGS = {
     # Cyrillic
     "windows-1251", "Windows-1251",
     # Central European
-    "cp1250"
+    "cp1250", "windows-1250", "Windows-1250",
 }
 
 ENCODING_ALIASES = {
@@ -129,10 +129,14 @@ def detect_safely(data: bytes) -> tuple[str | None, str]:
       1. Stage 5 binary detection: encoding=None means binary (verified hard:
          even with ignore_threshold=True, real binaries return None at
          confidence 0.95-1.00). This is our absolute binary cut.
-      2. encoding_era=MODERN_WEB shrinks the candidate space to web-relevant
-         encodings (no LEGACY_MAC / DOS / MAINFRAME noise).
-      3. prefer_superset=True collapses superset/subset siblings (CP949
-         absorbs EUC-KR; otherwise short EUC-KR files tie at gap=0).
+      2. encoding_era=MODERN_WEB | LEGACY_ISO keeps web-relevant encodings
+         plus the ISO-8859 family (no LEGACY_MAC / DOS / MAINFRAME noise).
+         LEGACY_ISO must be present: without it a genuine ISO-8859-2 file
+         top-detects as its near-twin cp1250 and gets wrongly converted.
+      3. prefer_superset=False so legacy ISO encodings win under their own
+         names and fall out at the RESTORE_ENCODINGS allowlist. With True,
+         chardet folds iso8859-2 -> cp1250 and iso8859-5 -> windows-1251
+         (lossy: the layouts differ), reintroducing the misconversion.
       4. RESTORE_ENCODINGS allowlist filter on top result.
       5. Floor at conf >= 0.10 to drop noise candidates (cp1006/IBM855-class).
 
@@ -167,8 +171,8 @@ def detect_safely(data: bytes) -> tuple[str | None, str]:
     try:
         top = chardet.detect(
             data,
-            encoding_era=EncodingEra.MODERN_WEB,
-            prefer_superset=True,
+            encoding_era=EncodingEra.MODERN_WEB | EncodingEra.LEGACY_ISO,
+            prefer_superset=False,
         )
     except Exception as e:
         return (None, f"detect raised: {e}")
@@ -348,7 +352,7 @@ def handle_pre(hook_json: dict):
 
     if convert_file(path, norm, "utf-8"):
         save_cache(session_id, path, norm, 1.0, line_ending)
-        _log(f"[{session_id[:8]}] converted {path} {norm}→utf-8 eol={line_ending}")
+        _log(f"[{session_id[:8]}] converted {path} {norm}→utf-8 eol={line_ending} ({reason})")
 
 
 def handle_post(hook_json: dict | None):
