@@ -55,6 +55,8 @@ RESTORE_ENCODINGS = {
     "Windows-1252", "windows-1252", "ISO-8859-1", "iso-8859-1",
     # Cyrillic
     "windows-1251", "Windows-1251",
+    # Central European
+    "cp1250"
 }
 
 ENCODING_ALIASES = {
@@ -190,7 +192,7 @@ def detect_safely(data: bytes) -> tuple[str | None, str]:
     if top_conf < 0.10:
         return (None, f"top {top_enc!r} conf={top_conf:.2f} below noise floor 0.10")
 
-    return (top_enc, "")
+    return (top_enc, f"conf={top_conf:.2f}")
 
 
 def detect_line_ending(raw: bytes) -> str:
