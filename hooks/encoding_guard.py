@@ -17,7 +17,7 @@ Strategy:
 Recovery commands (user-invoked CLI, not hooks):
     scan / scan-current           read-only report of cache records
     restore-current               restore orphaned files under the cwd
-    prune-current                 delete defunct records under the cwd
+    prune-current                 delete obsolete records under the cwd
 
 Cache layout:
     <tempdir>/.cc_encoding_cache/<session_id>/<sha256(normalized_path)[:16]>.json
@@ -479,13 +479,10 @@ def handle_restore_all(hook_json: dict | None):
 # read — user project files are never crawled.
 # ---------------------------------------------------------------------------
 
-RECENT_SECONDS = 3600  # session dirs younger than this may belong to a live session
-
-
 def classify_record(record_file: str) -> tuple[str, dict | None, str]:
     """Classify one cache record by on-disk facts.
 
-    "moot"       — provably worthless: unreadable/invalid record, target
+    "obsolete"       — provably worthless: unreadable/invalid record, target
                    file missing, or file no longer valid UTF-8 (already
                    restored, reverted, or rewritten). Safe to delete.
     "actionable" — target file exists and is valid UTF-8: a restore is
@@ -497,17 +494,17 @@ def classify_record(record_file: str) -> tuple[str, dict | None, str]:
         with open(record_file, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        return ("moot", None, f"unreadable record: {e}")
+        return ("obsolete", None, f"unreadable record: {e}")
     if (not isinstance(data, dict)
             or not isinstance(data.get("path"), str)
             or not data["path"]
             or not isinstance(data.get("encoding"), str)
             or data.get("line_ending") not in ("lf", "crlf")
             or _strip_enc(data["encoding"]) not in _RESTORE_SET):
-        return ("moot", data if isinstance(data, dict) else None, "invalid record fields")
+        return ("obsolete", data if isinstance(data, dict) else None, "invalid record fields")
     path = data["path"]
     if not os.path.isfile(path):
-        return ("moot", data, "target file no longer exists")
+        return ("obsolete", data, "target file no longer exists")
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -517,7 +514,7 @@ def classify_record(record_file: str) -> tuple[str, dict | None, str]:
     try:
         raw.decode("utf-8")
     except UnicodeDecodeError:
-        return ("moot", data, "file is no longer UTF-8 (already restored or rewritten)")
+        return ("obsolete", data, "file is no longer UTF-8 (already restored or rewritten)")
     return ("actionable", data, "file is UTF-8; original encoding on record")
 
 
@@ -582,21 +579,19 @@ def collect_records(scope_cwd: str | None) -> list[dict]:
     return rows
 
 
-def _guard_reason(row: dict, include_all: bool) -> str | None:
+def _guard_reason(row: dict) -> str | None:
     """Why this record must not be modified right now, or None.
 
-    Liveness is judged per RECORD (its file mtime), not per session dir:
-    a live session's in-flight record was written seconds ago, while an
-    orphan record is old by definition. Directory mtime would self-lock —
-    our own restore/prune bump the dir mtime by unlinking siblings.
+    The only guard is the session's own records (a known fact via
+    CLAUDE_CODE_SESSION_ID — they are in-flight and will be handled by the
+    Stop/SessionEnd hooks). Records of OTHER possibly-live sessions are
+    deliberately not second-guessed: concurrent sessions on the same
+    project are declared unsupported in the README, and scan/restore/prune
+    only ever run on the user's explicit request.
     """
     own = _own_session_dir_name()
     if own is not None and row["session"] == own:
         return "own live session (CLAUDE_CODE_SESSION_ID)"
-    age_s = row["record_age_seconds"]
-    if not include_all and age_s is not None and age_s < RECENT_SECONDS:
-        return (f"record written {age_s // 60}m ago — possibly a live "
-                f"session; pass --all to override")
     return None
 
 
@@ -622,13 +617,13 @@ def handle_scan(scope_cwd: str | None, as_json: bool) -> int:
     """Read-only report. Never modifies records or files."""
     rows = collect_records(scope_cwd)
     actionable = [r for r in rows if r["category"] == "actionable"]
-    moot = [r for r in rows if r["category"] == "moot"]
+    obsolete = [r for r in rows if r["category"] == "obsolete"]
     if as_json:
         print(json.dumps({
             "cache_root": CACHE_ROOT,
             "scope": scope_cwd,
             "own_session": _own_session_dir_name(),
-            "summary": {"actionable": len(actionable), "moot": len(moot)},
+            "summary": {"actionable": len(actionable), "obsolete": len(obsolete)},
             "records": rows,
         }, ensure_ascii=False, indent=2))
         return 0
@@ -636,23 +631,18 @@ def handle_scan(scope_cwd: str | None, as_json: bool) -> int:
     if not rows:
         print(f"encoding-guard: no cache records found{where}. Clean.")
         return 0
-    print(f"encoding-guard: {len(actionable)} restorable, {len(moot)} defunct record(s){where}\n")
+    print(f"encoding-guard: {len(actionable)} restorable, {len(obsolete)} obsolete record(s){where}\n")
     by_session: dict[str, list[dict]] = {}
     for r in rows:
         by_session.setdefault(r["session"], []).append(r)
     own = _own_session_dir_name()
     for name, group in by_session.items():
         tags = [_age_str(group[0]["session_age_seconds"])]
-        fresh_records = [r for r in group
-                         if r["record_age_seconds"] is not None
-                         and r["record_age_seconds"] < RECENT_SECONDS]
         if own is not None and name == own:
             tags.append("THIS session")
-        elif fresh_records:
-            tags.append("possibly live")
         print(f"session {name} ({', '.join(tags)}):")
         for r in group:
-            mark = "RESTORABLE" if r["category"] == "actionable" else "defunct"
+            mark = "RESTORABLE" if r["category"] == "actionable" else "obsolete"
             target = r["path"] or r["record_file"]
             enc = f" [{r['encoding']}]" if r["encoding"] else ""
             print(f"  {mark:>10}  {target}{enc} — {r['detail']}")
@@ -661,8 +651,8 @@ def handle_scan(scope_cwd: str | None, as_json: bool) -> int:
         if actionable:
             print("To restore these files to their original encoding, run this "
                   "command again with mode 'restore-current'.")
-        if moot:
-            print("To remove defunct records, run mode 'prune-current'.")
+        if obsolete:
+            print("To remove obsolete records, run mode 'prune-current'.")
     else:
         print("Note: restore/prune operate per-project — cd into the project "
               "and use restore-current / prune-current.")
@@ -678,7 +668,7 @@ def _match_paths_filter(row: dict, paths_filter: list[str] | None) -> bool:
     return any(normalize_path(os.path.abspath(p)) == target for p in paths_filter)
 
 
-def handle_restore_current(paths_filter: list[str] | None, include_all: bool) -> int:
+def handle_restore_current(paths_filter: list[str] | None) -> int:
     """Restore actionable records whose target lies under the current directory."""
     cwd = os.getcwd()
     rows = collect_records(cwd)
@@ -687,7 +677,7 @@ def handle_restore_current(paths_filter: list[str] | None, include_all: bool) ->
     for row in rows:
         if row["category"] != "actionable" or not _match_paths_filter(row, paths_filter):
             continue
-        reason = _guard_reason(row, include_all)
+        reason = _guard_reason(row)
         if reason is not None:
             print(f"SKIP     {row['path']} — {reason}")
             skipped += 1
@@ -712,9 +702,9 @@ def handle_restore_current(paths_filter: list[str] | None, include_all: bool) ->
     return 0 if failed == 0 else 1
 
 
-def handle_prune_current(paths_filter: list[str] | None, include_all: bool,
+def handle_prune_current(paths_filter: list[str] | None,
                          discard_actionable: bool) -> int:
-    """Delete defunct records under the current directory.
+    """Delete obsolete records under the current directory.
 
     Actionable records are deleted only with --discard (the user accepts
     the current UTF-8 state and wants the reminder gone).
@@ -728,7 +718,7 @@ def handle_prune_current(paths_filter: list[str] | None, include_all: bool,
             continue
         if row["category"] == "actionable" and not discard_actionable:
             continue
-        reason = _guard_reason(row, include_all)
+        reason = _guard_reason(row)
         if reason is not None:
             print(f"SKIP   {row['path'] or row['record_file']} — {reason}")
             skipped += 1
@@ -755,8 +745,6 @@ def run_recovery_cli(mode: str, argv: list[str]) -> int:
     else:
         ap.add_argument("--path", action="append", default=[],
                         help="only this file (repeatable)")
-        ap.add_argument("--all", action="store_true",
-                        help="include recently-active session dirs")
         if mode == "prune-current":
             ap.add_argument("--discard", action="store_true",
                             help="also delete restorable records (accept current UTF-8 state)")
@@ -766,8 +754,8 @@ def run_recovery_cli(mode: str, argv: list[str]) -> int:
     if mode == "scan-current":
         return handle_scan(os.getcwd(), args.json)
     if mode == "restore-current":
-        return handle_restore_current(args.path or None, args.all)
-    return handle_prune_current(args.path or None, args.all, args.discard)
+        return handle_restore_current(args.path or None)
+    return handle_prune_current(args.path or None, args.discard)
 
 
 HOOK_MODES = ("pre", "post", "restore-all")
