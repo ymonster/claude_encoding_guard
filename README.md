@@ -73,7 +73,7 @@ A migration to chardet 7.x is being prototyped on the [`chardet7-preview`](https
 
 - **Claude Code assumes absolute paths.** This plugin relies on Claude Code providing absolute file paths in hook stdin JSON, which is the observed behavior. Symbolic links or junctions pointing to the same file may produce different cache keys.
 
-- **Concurrent Claude Code instances on the same file.** If two CC instances edit or read the same file at the same time, one session's Stop restore can overwrite another session's pending Edit. Session-isolated caches prevent most cross-contamination, but a race window remains. Concurrent use is rare enough that this trade-off is accepted in exchange for Read-without-Edit recovery. The recovery commands additionally skip records written within the last hour unless `--all` is passed.
+- **Concurrent Claude Code instances on the same file.** If two CC instances edit or read the same file at the same time, one session's Stop restore can overwrite another session's pending Edit. Session-isolated caches prevent most cross-contamination, but a race window remains. Concurrent use is rare enough that this trade-off is accepted in exchange for Read-without-Edit recovery. The same applies to `/encoding-guard:scan`: it runs only when you ask, and it cannot tell whether another window's session is still alive — close other Claude Code instances working in the same project before using it.
 
 ## Crash Recovery
 
@@ -86,28 +86,35 @@ If Claude Code is killed mid-session (crash, terminal closed), files can be left
 | `SessionStart(resume)` restore-all | resuming a session | heals crash residue before anything else runs in the resumed session |
 | `/encoding-guard:scan` | you run it | finds records left by crashed sessions you never resumed |
 
-The first three are automatic — resuming a crashed session (CLI `--resume` / `-c` or the TUI `/resume` picker all keep the session ID) is enough to self-heal. The only case needing you: a crashed session you never resume. That's what `/encoding-guard:scan` is for.
+The first three are built in — resuming a crashed session (CLI `--resume` / `-c` or the TUI `/resume` picker all keep the session ID) is enough to recover. But if a crashed session is never resumed, files may be left in their UTF-8 state and cache records may be left behind. For the current directory, run `/encoding-guard:scan` to find them.
 
-Every conversion and restore is also appended to a forensic log at `<tmpdir>/.cc_encoding_cache/encoding_guard.log`, including the hook event that triggered it — useful because operations running in process-shutdown windows (e.g. `SessionEnd` after the terminal is closed) leave no other trace.
+Every conversion and restore is written to a log, including the hook event that triggered it. The log lives at `<tmpdir>/.cc_encoding_cache/encoding_guard.log`, where `<tmpdir>` is the system temp directory: usually `C:\Users\<name>\AppData\Local\Temp` (`%TEMP%`) on Windows, `/tmp` on Linux/macOS. To confirm the location on your machine, run `python -c "import tempfile; print(tempfile.gettempdir())"`.
 
 ## The `/encoding-guard:scan` Command
 
-One command, run inside Claude Code from the affected project:
+This is currently the only command the plugin provides:
 
 ```
 /encoding-guard:scan
 ```
 
-It checks the plugin's own cache records for files **under the current project** that were left UTF-8-converted (it never crawls your project files). If everything is clean it says so and stops. If it finds leftovers, it shows what it found and asks what to do:
+It inspects only the plugin's own cache records (it never crawls your project files), finding files **under the current directory** that were left in their UTF-8-converted state, plus leftover cache records, and reports or asks. Records fall into two classes:
 
-- **Restore all** — convert every recoverable file back to its original encoding
-- **Discard all records** — keep the files as UTF-8 and forget them
-- **Pick per file** — choose file by file
-- **Not now** — leave everything untouched
+- **Restorable** — the file still exists and is still UTF-8; the record can convert it back to its original encoding
+- **Obsolete** — the file was deleted, is already back in its original encoding, or the record itself is corrupt. Nothing can be done with these; they are cleaned up silently (only the cache record is deleted)
 
-Safety rules: records belonging to the session you're in — or written within the last hour (likely a live session in another window) — are skipped automatically; records that are provably obsolete (file deleted, or already back in its original encoding) are cleaned up silently. Orphans in a different project? Run the command from that project.
+If everything is clean it says so and stops. When restorable files are found, it shows the list (with each record's age) and asks:
 
-The underlying script modes the command drives (`scan` / `scan-current` / `restore-current` / `prune-current`) are internal machinery, documented in [TECHNICAL.md](TECHNICAL.md) for debugging and development.
+- **Restore all** — convert every file back to its original encoding
+- **Discard all records** — keep the files as UTF-8 and delete the records (the plugin's cache records). Note: the record is the only place that remembers what encoding a file originally had — once deleted, restore is permanently impossible
+- **Pick per file** — two checklists side by side: **Restore** (check what to restore) and **Discard** (check what to give up). Checked in neither = left alone for this run; the record stays and a later run will ask again. Checked in both = treated as restore
+- **Not now** — touch nothing
+
+Restore results are reported file by file. A failed restore (typically the file was edited while UTF-8 and now holds characters the original encoding cannot represent — e.g. an emoji in a GBK file) shows the reason and keeps the record — the remaining options are discarding the record, or fixing the content by hand and trying again.
+
+Safety rules: records belonging to the session you're in are skipped automatically (its own hooks handle them). Each record is shown with its age — a hint for spotting another session that may still be working on files under the same path.
+
+The command is driven by a few script modes (`scan` / `scan-current` / `restore-current` / `prune-current`) — internal implementation, documented in [TECHNICAL.md](TECHNICAL.md) for debugging and development.
 
 ## Advanced Configuration
 
@@ -132,6 +139,8 @@ See [TECHNICAL.md](TECHNICAL.md) for implementation details including platform q
 Thanks to [@lbresler](https://github.com/lbresler) for [#1](https://github.com/ymonster/claude_encoding_guard/pull/1) (alias-dash mismatch fix for ISO-8859-1 / GB2312) and [#2](https://github.com/ymonster/claude_encoding_guard/pull/2) (`handle_restore_all` + Stop hook recovery for Read-without-Edit).
 
 Thanks to [@Pacman766](https://github.com/Pacman766) for [#3](https://github.com/ymonster/claude_encoding_guard/pull/3) (Windows-1251 / CP1251 support for Cyrillic text).
+
+Thanks to [@albert-polak](https://github.com/albert-polak) for [#4](https://github.com/ymonster/claude_encoding_guard/pull/4) (Windows-1250 / CP1250 support for Central European text, currently on the `chardet7-preview` branch).
 
 ## License
 

@@ -170,21 +170,21 @@ Resume keeps the session ID on all three paths — CLI `--resume`, CLI `--contin
 
 `scan` / `scan-current` are read-only reports over `CACHE_ROOT/*/​*.json` (discovery is record-driven — user project files are never crawled). Each record is classified by on-disk facts only:
 
-- **moot** — provably worthless: unreadable/invalid record, target file missing, or target no longer valid UTF-8 (already restored or rewritten). Safe to prune.
+- **obsolete** — provably worthless: unreadable/invalid record, target file missing, or target no longer valid UTF-8 (already restored or rewritten). Safe to prune.
 - **actionable** — target exists and is valid UTF-8: restore is possible. Deliberately no encode-back test at scan time; a content drift that no longer fits the original encoding is discovered and reported by `restore-current` itself (`convert_file` fails gracefully and keeps the record).
 
-`restore-current` / `prune-current` act only on records whose target lies under the cwd — there is intentionally **no global restore**: batch-restoring across projects is a decision no user can responsibly make in one keypress. Guards on both: the running session's own dir is excluded via `CLAUDE_CODE_SESSION_ID`, and records written within the last hour are skipped unless `--all` (a live parallel session's in-flight records look identical to orphans; the user is the only reliable liveness oracle). The liveness heuristic is judged per record file, not per session dir — restore/prune unlink sibling records and would bump the dir mtime, locking the user out of their own follow-up command.
+`restore-current` / `prune-current` act only on records whose target lies under the cwd — there is intentionally **no global restore**: batch-restoring across projects is a decision no user can responsibly make in one keypress. The single guard on both is the running session's own dir, excluded via `CLAUDE_CODE_SESSION_ID` — a known fact, not a heuristic (those records are in-flight and the session's own Stop/SessionEnd hooks handle them). An earlier design also skipped records younger than one hour as "possibly a live parallel session"; it was dropped: the threshold is arbitrary, mtime is an indirect proxy, and concurrent sessions on one project are already declared unsupported in the README — the commands run only on the user's explicit request, and what to do then is the user's call. Record age is still reported, as information.
 
 **The modes are internal machinery**: the single user-facing surface is `/encoding-guard:scan`, which drives them. Direct invocation is a debugging/development affordance:
 
 ```bash
 uv run --script hooks/encoding_guard.py scan [--json]              # read-only, all sessions & paths
 uv run --script hooks/encoding_guard.py scan-current [--json]      # read-only, targets under cwd
-uv run --script hooks/encoding_guard.py restore-current [--path FILE]... [--all]
-uv run --script hooks/encoding_guard.py prune-current [--path FILE]... [--all] [--discard]
+uv run --script hooks/encoding_guard.py restore-current [--path FILE]...
+uv run --script hooks/encoding_guard.py prune-current [--path FILE]... [--discard]
 ```
 
-(`--json` machine-readable output; `--path` repeatable single-file filter; `--all` overrides the fresh-record guard; `--discard` extends prune to restorable records. When run from an installed plugin, the script lives under the plugin cache root — `~/.claude/plugins/cache/...` — which is exactly why end-user docs point at the slash command instead.) `prune-current` deletes moot records; actionable ones only with `--discard` (user accepts the UTF-8 state).
+(`--json` machine-readable output; `--path` repeatable single-file filter; `--discard` extends prune to restorable records. When run from an installed plugin, the script lives under the plugin cache root — `~/.claude/plugins/cache/...` — which is exactly why end-user docs point at the slash command instead.) `prune-current` deletes obsolete records; actionable ones only with `--discard` (user accepts the UTF-8 state).
 
 The `/encoding-guard:scan` slash command wraps this flow: inline `!`-preprocessing runs `scan-current --json` deterministically, then the command guides an AskUserQuestion (restore all / discard / pick per file / not now). Scan output is treated as untrusted data in that flow — only whitelisted-encoding names and normalized paths reach the option labels.
 
