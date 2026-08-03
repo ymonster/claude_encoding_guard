@@ -47,6 +47,8 @@ import time
 
 CACHE_ROOT = os.path.join(tempfile.gettempdir(), ".cc_encoding_cache")
 STALE_HOURS = 24
+LOG_FILE = os.path.join(CACHE_ROOT, "encoding_guard.log")
+LOG_MAX_BYTES = 512 * 1024
 
 RESTORE_ENCODINGS = {
     "gb2312", "gbk", "gb18030",
@@ -84,6 +86,28 @@ def _strip_enc(name: str) -> str:
 
 def _log(msg: str):
     sys.stderr.write(f"encoding_guard: {msg}\n")
+
+
+def _flog(event: str):
+    """Append one line to the forensic log (CACHE_ROOT/encoding_guard.log).
+
+    Hook stderr is captured into transcripts, but operations that run in
+    process-shutdown windows (e.g. SessionEnd restore-all after the
+    terminal is closed) never reach a transcript — this file is the
+    durable trail for every file mutation. Best-effort: never raises.
+    """
+    try:
+        os.makedirs(CACHE_ROOT, exist_ok=True)
+        try:
+            if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+        except OSError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{stamp} {event}\n")
+    except OSError:
+        pass
 
 
 def normalize_encoding(enc: str) -> str:
@@ -351,6 +375,8 @@ def handle_pre(hook_json: dict):
         save_cache(session_id, path, norm, confidence, line_ending)
         _log(f"[{session_id[:8]}] converted {path} {norm}->utf-8 eol={line_ending} "
              f"(confidence={confidence:.2f})")
+        _flog(f"[{session_id[:8]}] pre converted {path} {norm}->utf-8 "
+              f"eol={line_ending} conf={confidence:.2f}")
 
 
 def handle_post(hook_json: dict | None):
@@ -369,6 +395,7 @@ def handle_post(hook_json: dict | None):
     orig_eol = cached.get("line_ending", "lf")
 
     if convert_file(path, "utf-8", orig_enc, target_eol=orig_eol):
+        _flog(f"[{session_id[:8]}] post restored {path} utf-8->{orig_enc} eol={orig_eol}")
         if delete_cache(session_id, path):
             _log(f"[{session_id[:8]}] restored {path} utf-8->{orig_enc} eol={orig_eol}")
         else:
@@ -377,13 +404,19 @@ def handle_post(hook_json: dict | None):
     else:
         _log(f"[{session_id[:8]}] restore FAILED for {path}, "
              f"file remains UTF-8, cache preserved for retry")
+        _flog(f"[{session_id[:8]}] post restore FAILED {path} (target {orig_enc})")
 
 
 def handle_restore_all(hook_json: dict | None):
-    """Restore every file still in the session cache (e.g. Read-only without Edit)."""
+    """Restore every file still in the session cache (e.g. Read-only without Edit).
+
+    Registered for Stop, SessionEnd, and SessionStart(resume) — the
+    triggering event is taken from stdin for the forensic log.
+    """
     if not hook_json:
         return
     session_id = hook_json.get("session_id", "unknown")
+    trigger = hook_json.get("hook_event_name") or "Stop"
     sd = session_dir(session_id)
     if not os.path.isdir(sd):
         return
@@ -421,9 +454,15 @@ def handle_restore_all(hook_json: dict | None):
         orig_eol = cached["line_ending"]
         if convert_file(path, "utf-8", orig_enc, target_eol=orig_eol):
             delete_cache(session_id, path)
-            _log(f"[{session_id[:8]}] stop-restored {path} utf-8->{orig_enc} eol={orig_eol}")
+            _log(f"[{session_id[:8]}] restore-all[{trigger}] restored {path} "
+                 f"utf-8->{orig_enc} eol={orig_eol}")
+            _flog(f"[{session_id[:8]}] restore-all[{trigger}] restored {path} "
+                  f"utf-8->{orig_enc} eol={orig_eol}")
         else:
-            _log(f"[{session_id[:8]}] stop-restore FAILED for {path}, cache preserved")
+            _log(f"[{session_id[:8]}] restore-all[{trigger}] FAILED for {path}, "
+                 f"cache preserved")
+            _flog(f"[{session_id[:8]}] restore-all[{trigger}] FAILED {path} "
+                  f"(target {orig_enc})")
     # Remove session dir if every entry was cleaned up via os.unlink
     # (delete_cache paths already handle this, but orphan paths above don't).
     with contextlib.suppress(OSError):
@@ -660,10 +699,13 @@ def handle_restore_current(paths_filter: list[str] | None, include_all: bool) ->
                 os.unlink(row["record_file"])
             touched_sessions.add(row["session"])
             print(f"RESTORED {row['path']} utf-8->{enc} eol={eol}")
+            _flog(f"[cli] restore-current restored {row['path']} utf-8->{enc} "
+                  f"(session {row['session'][:8]})")
             restored += 1
         else:
             print(f"FAILED   {row['path']} — could not re-encode to {enc}; "
                   f"record kept (file may have been edited as UTF-8)")
+            _flog(f"[cli] restore-current FAILED {row['path']} (target {enc})")
             failed += 1
     _cleanup_empty_dirs(touched_sessions)
     print(f"\nrestore-current: {restored} restored, {failed} failed, {skipped} skipped")
@@ -696,6 +738,8 @@ def handle_prune_current(paths_filter: list[str] | None, include_all: bool,
         touched_sessions.add(row["session"])
         label = "discarded" if row["category"] == "actionable" else "pruned"
         print(f"{label.upper():>9}  {row['path'] or row['record_file']} — {row['detail']}")
+        _flog(f"[cli] prune-current {label} {row['path'] or row['record_file']} "
+              f"({row['detail']})")
         pruned += 1
     _cleanup_empty_dirs(touched_sessions)
     print(f"\nprune-current: {pruned} removed, {skipped} skipped")
