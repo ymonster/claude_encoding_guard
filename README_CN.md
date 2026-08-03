@@ -86,32 +86,28 @@ Claude Code 中途被杀（崩溃、终端被关）时，文件可能停留在�
 | `SessionStart(resume)` restore-all | resume 会话时 | 在 resume 后任何动作之前清理崩溃残留 |
 | `/encoding-guard:scan` | 手动运行 | 找出再也没 resume 的崩溃会话留下的记录 |
 
-前三层全自动——resume 崩溃的会话（CLI `--resume` / `-c` 或 TUI 的 `/resume` 选单都保持 session ID）即可自愈。唯一需要你出手的场景：崩溃后再也没 resume 的会话——用下面的恢复命令处理，交互式入口是 `/encoding-guard:scan`，也可以直接在终端跑。
+前三层全自动——resume 崩溃的会话（CLI `--resume` / `-c` 或 TUI 的 `/resume` 选单都保持 session ID）即可自愈。唯一需要你出手的场景：崩溃后再也没 resume 的会话——这就是 `/encoding-guard:scan` 存在的意义。
 
 每次转换和恢复还会追加写入取证日志 `<tmpdir>/.cc_encoding_cache/encoding_guard.log`（含触发它的 hook 事件名）——这很有用，因为进程退场窗口里的操作（比如关闭终端后的 `SessionEnd`）不会留下任何其它痕迹。
 
-## 恢复命令
+## `/encoding-guard:scan` 命令
 
-所有恢复命令只操作插件自己的缓存记录（`<tmpdir>/.cc_encoding_cache/<session_id>/*.json`），**绝不扫描你的项目文件**。范围一览：
+只有一个命令，在受影响的项目里、Claude Code 中运行：
 
-| 命令 | 范围 | 是否修改 |
-|---|---|---|
-| `scan` | **所有**会话的**所有**记录，不限路径 | 否（只读报告） |
-| `scan-current` | 仅目标文件位于**当前目录**下的记录 | 否（只读报告） |
-| `restore-current` | **当前目录**下的可恢复记录 | 把文件转回原编码，消费对应记录 |
-| `prune-current` | **当前目录**下的记录 | 删除作废记录；加 `--discard` 连可恢复的一起删（文件保持 UTF-8） |
-
-```bash
-uv run --script <plugin>/hooks/encoding_guard.py scan [--json]
-uv run --script <plugin>/hooks/encoding_guard.py scan-current [--json]
-uv run --script <plugin>/hooks/encoding_guard.py restore-current [--path 文件]... [--all]
-uv run --script <plugin>/hooks/encoding_guard.py prune-current [--path 文件]... [--all] [--discard]
+```
+/encoding-guard:scan
 ```
 
-- 记录按盘上事实分类：**可恢复**（目标文件存在且是合法 UTF-8）或**作废**（记录损坏、目标文件不存在、或已不是 UTF-8——即早已恢复或被重写）。只有可 100% 证明作废的记录才会被自动删除。
-- 刻意**不提供全局 restore**——恢复是按项目做的决定；`cd` 到各项目分别跑 `restore-current`。全局 `scan` 只提供只读总览。
-- 修改类命令的安全挡板：永不碰正在运行会话的记录（通过 `CLAUDE_CODE_SESSION_ID` 识别）；默认跳过最近一小时内写入的记录（新鲜记录大概率属于另一个窗口里的活跃会话，`--all` 覆盖）。
-- Claude Code 里的 `/encoding-guard:scan` 底层跑的就是 `scan-current`，并以交互方式引导你选择（全部恢复 / 放弃记录 / 逐个选择）。
+它检查插件自己的缓存记录，找出**当前项目下**被留在 UTF-8 转换态的文件（绝不扫描你的项目文件本身）。一切干净就直接告诉你并结束；发现残留则展示清单并询问怎么处理：
+
+- **全部恢复** —— 把每个可恢复的文件转回原编码
+- **放弃全部记录** —— 文件保持 UTF-8，忘掉这些记录
+- **逐个选择** —— 一个文件一个文件地决定
+- **暂不处理** —— 什么都不动
+
+安全规则：属于你当前所在会话的记录、以及最近一小时内写入的记录（大概率属于另一个窗口里的活跃会话）会被自动跳过；可 100% 证明作废的记录（文件已删除、或已经回到原编码）会被静默清理。别的项目里有残留？到那个项目里运行同一命令。
+
+命令背后驱动的脚本 mode（`scan` / `scan-current` / `restore-current` / `prune-current`）属于内部机件，面向调试和开发的说明在 [TECHNICAL.md](TECHNICAL.md)。
 
 ## 高级配置
 

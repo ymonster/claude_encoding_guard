@@ -86,32 +86,28 @@ If Claude Code is killed mid-session (crash, terminal closed), files can be left
 | `SessionStart(resume)` restore-all | resuming a session | heals crash residue before anything else runs in the resumed session |
 | `/encoding-guard:scan` | you run it | finds records left by crashed sessions you never resumed |
 
-The first three are automatic — resuming a crashed session (CLI `--resume` / `-c` or the TUI `/resume` picker all keep the session ID) is enough to self-heal. The only case needing you: a crashed session you never resume. Handle it with the recovery commands below — interactively via `/encoding-guard:scan`, or from a terminal.
+The first three are automatic — resuming a crashed session (CLI `--resume` / `-c` or the TUI `/resume` picker all keep the session ID) is enough to self-heal. The only case needing you: a crashed session you never resume. That's what `/encoding-guard:scan` is for.
 
 Every conversion and restore is also appended to a forensic log at `<tmpdir>/.cc_encoding_cache/encoding_guard.log`, including the hook event that triggered it — useful because operations running in process-shutdown windows (e.g. `SessionEnd` after the terminal is closed) leave no other trace.
 
-## Recovery Commands
+## The `/encoding-guard:scan` Command
 
-All recovery commands work off the plugin's own cache records (`<tmpdir>/.cc_encoding_cache/<session_id>/*.json`) — they never crawl your project files. Scope at a glance:
+One command, run inside Claude Code from the affected project:
 
-| Command | Scope | Modifies |
-|---|---|---|
-| `scan` | **every** record from **every** session, any path | nothing (read-only report) |
-| `scan-current` | only records whose target file lies under the **current directory** | nothing (read-only report) |
-| `restore-current` | restorable records under the **current directory** | converts files back to their original encoding, consumes their records |
-| `prune-current` | records under the **current directory** | deletes defunct records; with `--discard` also deletes restorable ones (keep files as UTF-8) |
-
-```bash
-uv run --script <plugin>/hooks/encoding_guard.py scan [--json]
-uv run --script <plugin>/hooks/encoding_guard.py scan-current [--json]
-uv run --script <plugin>/hooks/encoding_guard.py restore-current [--path FILE]... [--all]
-uv run --script <plugin>/hooks/encoding_guard.py prune-current [--path FILE]... [--all] [--discard]
+```
+/encoding-guard:scan
 ```
 
-- Records are classified by on-disk facts: **restorable** (target exists and is valid UTF-8) or **defunct** (record invalid, target gone, or target no longer UTF-8 — i.e. already restored or rewritten). Only provably defunct records are ever auto-deleted.
-- There is deliberately **no global restore** — restoring is a per-project decision; `cd` into each project and run `restore-current` there. The global `scan` exists for a read-only overview.
-- Guards on the mutating commands: records of the running session are never touched (identified via `CLAUDE_CODE_SESSION_ID`), and records written within the last hour are skipped unless `--all` is passed — a fresh record most likely belongs to a live session in another window.
-- `/encoding-guard:scan` inside Claude Code runs `scan-current` under the hood and walks you through the choices interactively (restore all / discard / pick per file).
+It checks the plugin's own cache records for files **under the current project** that were left UTF-8-converted (it never crawls your project files). If everything is clean it says so and stops. If it finds leftovers, it shows what it found and asks what to do:
+
+- **Restore all** — convert every recoverable file back to its original encoding
+- **Discard all records** — keep the files as UTF-8 and forget them
+- **Pick per file** — choose file by file
+- **Not now** — leave everything untouched
+
+Safety rules: records belonging to the session you're in — or written within the last hour (likely a live session in another window) — are skipped automatically; records that are provably obsolete (file deleted, or already back in its original encoding) are cleaned up silently. Orphans in a different project? Run the command from that project.
+
+The underlying script modes the command drives (`scan` / `scan-current` / `restore-current` / `prune-current`) are internal machinery, documented in [TECHNICAL.md](TECHNICAL.md) for debugging and development.
 
 ## Advanced Configuration
 
