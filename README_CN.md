@@ -17,7 +17,7 @@ Claude Code 编辑文件时，自动保留非 UTF-8 编码和行尾符。
 | ASCII 处理 | chardet 5.x 自然识别 | 显式短路（7.x 把 ASCII 报为 Windows-1252） |
 | `STRUCTURAL_TRUSTED` 旁路 | 有（binaryornot 对短 CJK / 混合 Cyrillic 误判） | 不需要（stage 5 无类似 FP） |
 | codec 名 | `gbk` / `shift_jis` / `euc-kr` | `GB18030` / `cp932` / `CP949`（superset codec，round-trip 更宽容） |
-| 测试 harness 结果 | 73/73 PASS | 73/73 PASS |
+| 测试 harness 结果（89 fixtures，含中欧） | 79/89（10 个已知 5.x 误检） | 88/89（1 个 50 字节 cp1250 fixture 保守跳过） |
 
 详见 [TECHNICAL.md](TECHNICAL.md) → "chardet 7.x Migration Findings"。
 
@@ -72,8 +72,8 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
     ├─ ASCII 短路                            ├─ 读取缓存的编码 + 行尾风格
     ├─ 检测编码 (chardet 7.x)                ├─ UTF-8 → 原始编码
     │   ├─ stage 5 binary detection         ├─ 恢复行尾符
-    │   ├─ era=MODERN_WEB 候选限定           ├─ 删除会话缓存
-    │   └─ prefer_superset=True             └─ 完成
+    │   ├─ era=MODERN_WEB|LEGACY_ISO        ├─ 删除会话缓存
+    │   └─ prefer_superset=False            └─ 完成
     ├─ 检测行尾 (CRLF/LF)
     ├─ 原始编码 → UTF-8
     ├─ 保存会话缓存
@@ -84,7 +84,7 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 
 ## 功能
 
-- **编码保护**：GBK、GB2312、GB18030、Big5、Big5-HKSCS、EUC-TW、Shift_JIS、EUC-JP、ISO-2022-JP、EUC-KR、Windows-1252、ISO-8859-1
+- **编码保护**：GBK、GB2312、GB18030、Big5、Big5-HKSCS、EUC-TW、Shift_JIS、EUC-JP、ISO-2022-JP、EUC-KR、Windows-1252、Windows-1251（西里尔文）、Windows-1250（中欧）、ISO-8859-1
 - **行尾保护**：Claude Code 将 CRLF 转为 LF 后自动恢复
 - **二进制文件防护**：chardet 7.x 内置 stage 5 binary detection（始终开启）
 - **会话隔离**：多个 Claude Code 会话互不干扰
@@ -101,7 +101,7 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 - **chardet 7.x**：置信度模型重写为 cosine similarity 评分（不再是"我有多确定"，而是"判定路径有多硬"）。GB18030 由于 bigram 集合最大，几何上 confidence 永远在 0.14–0.25，与文件大小无关——所以我们用 0.10 噪声底线 + 白名单过滤，而非高置信度阈值。详见 [TECHNICAL.md](TECHNICAL.md)。
 - **二进制检测**：chardet 7.x pipeline stage 5 在非文本输入上返回 `encoding=None`，confidence 0.95–1.00，替代了 `main` 分支的 binaryornot 决策树。测试 fixture 集上未观察到误判。
 - **编码别名**：GB2312 → GBK（字节兼容超集），ISO-8859-1 → Windows-1252（行业惯例）。
-- **会话隔离缓存**：`<tmpdir>/.cc_encoding_cache/<session_id>/`——不跨会话干扰。24 小时自动清理残留。
+- **会话隔离缓存**：`<tmpdir>/.cc_encoding_cache/<session_id>/`——不跨会话干扰。Hook 严格只操作自己会话的记录；超过 24 小时的**空**会话目录自动清除，含记录的目录永不自动删除（见"崩溃恢复"）。
 
 ## 已知限制
 
@@ -113,7 +113,48 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 
 - **依赖绝对路径。** 本插件依赖 Claude Code 在 hook stdin JSON 中提供绝对路径（已验证的实际行为）。符号链接或 junction 指向同一文件可能产生不同的缓存键。
 
-- **多个 Claude Code 实例同时操作同一文件。** 两个 CC 实例并发编辑/读取同一文件时，一个会话 Stop 触发的恢复可能覆盖另一会话尚未完成的 Edit。会话隔离缓存阻止了大部分交叉污染，但仍有一个极窄的竞态窗口。并发使用极少见，这个 trade-off 被接受以换取 Read-without-Edit 的恢复能力。
+- **多个 Claude Code 实例同时操作同一文件。** 两个 CC 实例并发编辑/读取同一文件时，一个会话 Stop 触发的恢复可能覆盖另一会话尚未完成的 Edit。会话隔离缓存阻止了大部分交叉污染，但仍有一个极窄的竞态窗口。并发使用极少见，这个 trade-off 被接受以换取 Read-without-Edit 的恢复能力。`/encoding-guard:scan` 同理：它只在你主动运行时执行，且无法判断另一个窗口里的 session 是否还活着——使用前请先关闭同一项目下的其他 Claude Code 实例。
+
+## 崩溃恢复
+
+Claude Code 中途被杀（崩溃、终端被关）时，文件可能停留在临时的 UTF-8 状态。四层防线：
+
+| 层 | 时机 | 作用 |
+|---|---|---|
+| `Stop` restore-all | 每轮对话结束 | 恢复本轮读过但没编辑的文件 |
+| `SessionEnd` restore-all | 会话退出 | 兜底——含被 Esc 打断的轮次 |
+| `SessionStart(resume)` restore-all | resume 会话时 | 在 resume 后任何动作之前清理崩溃残留 |
+| `/encoding-guard:scan` | 手动运行 | 找出再也没 resume 的崩溃会话留下的记录 |
+
+前三层是内建机制——resume 崩溃的会话（CLI `--resume` / `-c` 或 TUI 的 `/resume` 选单都保持 session ID）即可按照规则进行恢复。但如果这个session从来没有resume过，就可能出现未被恢复的 UTF-8 文件或者未被清理的缓存记录。那么针对当前目录，可以使用`/encoding-guard:scan`进行扫描。
+
+每次转换和恢复都会写入日志（含触发它的 hook 事件名）。日志位于 `<tmpdir>/.cc_encoding_cache/encoding_guard.log`，其中 `<tmpdir>` 是系统临时目录：Windows 上通常是 `C:\Users\<用户名>\AppData\Local\Temp`（即 `%TEMP%`），Linux/macOS 上通常是 `/tmp`。如果想确认自己机器上的实际位置，可以运行 `python -c "import tempfile; print(tempfile.gettempdir())"`。
+
+## `/encoding-guard:scan` 命令
+
+这是插件目前提供的唯一一个命令：
+
+```
+/encoding-guard:scan
+```
+
+它只检查插件自己的缓存记录，找出**当前目录下**被留在 UTF-8 转换态的文件以及留存的缓存记录，并给出报告或选择。记录分两类：
+
+- **可恢复** —— 文件还在、还是 UTF-8 态，凭记录可以转回原编码
+- **已作废** —— 文件已删除、已经回到原编码、或记录本身损坏，这些会被静默清理（特指清理掉缓存记录）
+
+一切干净就直接告诉你并结束。发现可恢复的文件时，展示清单（含每条记录的存在时长）并询问怎么处理：
+
+- **Restore all**（全部恢复）—— 把每个文件转回原编码
+- **Discard all records**（放弃全部记录）—— 文件保持 UTF-8，删除记录（指插件生成的缓存记录）。注意：记录是唯一记得"这个文件原本是什么编码"的地方，删了就永久无法再恢复
+- **Pick per file**（逐个决定）—— 并排出现两栏勾选：**Restore**（勾要恢复的）和 **Discard**（勾要放弃的）。两边都不勾 = 这次不动它，记录保留，下次运行还会再问；两边都勾 = 按恢复处理
+- **Not now**（暂不处理）—— 什么都不动
+
+恢复结果逐条报告。恢复失败（通常是文件在 UTF-8 期间被编辑进了原编码无法表示的字符，比如 GBK 文件里进了 emoji）会给出原因，记录保留——此时的出路只剩放弃记录，或自己手工处理内容后再试。
+
+安全规则：属于你当前所在会话的记录自动跳过（本会话自己的 hook 会处理它们）。每条记录都展示存在时长，这可能会提醒你是否当前有其它会话在处理同一个路径下的文件。
+
+命令背后由脚本的几个 mode（`scan` / `scan-current` / `restore-current` / `prune-current`）驱动，属于内部实现，面向调试和开发的说明在 [TECHNICAL.md](TECHNICAL.md)。
 
 ## 高级配置
 
@@ -138,6 +179,8 @@ PreToolUse (Read)                       PostToolUse (Edit/Write)
 感谢 [@lbresler](https://github.com/lbresler) 贡献的 [#1](https://github.com/ymonster/claude_encoding_guard/pull/1)（修复 ISO-8859-1 / GB2312 的 alias-dash 不匹配问题）和 [#2](https://github.com/ymonster/claude_encoding_guard/pull/2)（`handle_restore_all` + Stop hook 恢复 Read-without-Edit 场景）。
 
 感谢 [@Pacman766](https://github.com/Pacman766) 贡献的 [#3](https://github.com/ymonster/claude_encoding_guard/pull/3)（Windows-1251 / CP1251 西里尔文编码支持）。
+
+感谢 [@albert-polak](https://github.com/albert-polak) 贡献的 [#4](https://github.com/ymonster/claude_encoding_guard/pull/4)（Windows-1250 / CP1250 中欧编码支持）。
 
 ## License
 
