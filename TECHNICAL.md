@@ -177,6 +177,10 @@ Resume keeps the session ID on all three paths — CLI `--resume`, CLI `--contin
 
 The `/encoding-guard:scan` slash command wraps this flow: inline `!`-preprocessing runs `scan-current --json` deterministically, then the command guides an AskUserQuestion (restore all / discard / pick per file / not now). Scan output is treated as untrusted data in that flow — only whitelisted-encoding names and normalized paths reach the option labels.
 
+### Forensic log
+
+Hook stderr is captured into transcripts (`hook_success` attachments) in current CC versions, but operations executed in process-shutdown windows never get there — empirically, closing the terminal window on Windows delivers `CTRL_CLOSE_EVENT`, CC runs the SessionEnd hook inside the grace period, the restore succeeds, and no transcript entry survives to prove it. Every conversion/restore/prune is therefore also appended to `CACHE_ROOT/encoding_guard.log` (best-effort, size-capped with a single rotation) tagged with its trigger: `pre converted`, `post restored`, `restore-all[Stop|SessionEnd|SessionStart] restored`, `[cli] restore-current` / `prune-current`. This is the only durable evidence trail for the shutdown-window cases.
+
 ## Why Read-Time Conversion?
 
 ### Failed Approach: Edit-Time Conversion
