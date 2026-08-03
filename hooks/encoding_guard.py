@@ -349,7 +349,7 @@ def handle_pre(hook_json: dict):
 
     if convert_file(path, norm, "utf-8"):
         save_cache(session_id, path, norm, confidence, line_ending)
-        _log(f"[{session_id[:8]}] converted {path} {norm}→utf-8 eol={line_ending} "
+        _log(f"[{session_id[:8]}] converted {path} {norm}->utf-8 eol={line_ending} "
              f"(confidence={confidence:.2f})")
 
 
@@ -370,7 +370,7 @@ def handle_post(hook_json: dict | None):
 
     if convert_file(path, "utf-8", orig_enc, target_eol=orig_eol):
         if delete_cache(session_id, path):
-            _log(f"[{session_id[:8]}] restored {path} utf-8→{orig_enc} eol={orig_eol}")
+            _log(f"[{session_id[:8]}] restored {path} utf-8->{orig_enc} eol={orig_eol}")
         else:
             _log(f"[{session_id[:8]}] restored {path} but cache delete failed — "
                  f"stale cache will be cleaned on next pre")
@@ -421,7 +421,7 @@ def handle_restore_all(hook_json: dict | None):
         orig_eol = cached["line_ending"]
         if convert_file(path, "utf-8", orig_enc, target_eol=orig_eol):
             delete_cache(session_id, path)
-            _log(f"[{session_id[:8]}] stop-restored {path} utf-8→{orig_enc} eol={orig_eol}")
+            _log(f"[{session_id[:8]}] stop-restored {path} utf-8->{orig_enc} eol={orig_eol}")
         else:
             _log(f"[{session_id[:8]}] stop-restore FAILED for {path}, cache preserved")
     # Remove session dir if every entry was cleaned up via os.unlink
@@ -659,7 +659,7 @@ def handle_restore_current(paths_filter: list[str] | None, include_all: bool) ->
             with contextlib.suppress(OSError):
                 os.unlink(row["record_file"])
             touched_sessions.add(row["session"])
-            print(f"RESTORED {row['path']} utf-8→{enc} eol={eol}")
+            print(f"RESTORED {row['path']} utf-8->{enc} eol={eol}")
             restored += 1
         else:
             print(f"FAILED   {row['path']} — could not re-encode to {enc}; "
